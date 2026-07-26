@@ -200,7 +200,7 @@ mb-acme/
 建议为稳定版本创建 Git tag。安装指定版本时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.1.1 bash
 ```
 
 也可以在 fork 中覆盖默认仓库：

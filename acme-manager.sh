@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 PROGRAM="acme-manager"
 INSTALL_PATH="/usr/local/sbin/acme-manager"
 ACME_HOME="${ACME_HOME:-/root/.acme.sh}"
@@ -364,8 +364,9 @@ collect_domains() {
 }
 
 certificate_exists() {
-  local domain="$1"
-  [[ -s "${ACME_HOME}/${domain}_ecc/${domain}.conf" ]]
+  local domain="$1" cert_dir
+  cert_dir="${ACME_HOME}/${domain}_ecc"
+  [[ -s "${cert_dir}/${domain}.cer" && -s "${cert_dir}/fullchain.cer" && -s "${cert_dir}/${domain}.key" ]]
 }
 
 build_domain_args() {
