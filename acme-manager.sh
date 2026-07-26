@@ -4,9 +4,12 @@
 set -uo pipefail
 umask 077
 
-VERSION="2.1.1"
+VERSION="2.2.0"
 PROGRAM="acme-manager"
-INSTALL_PATH="/usr/local/sbin/acme-manager"
+INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
+MANAGER_REPO="${ACME_MANAGER_REPO:-BBMCoin04/mb-acme}"
+MANAGER_REF="${ACME_MANAGER_REF:-main}"
+MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/${MANAGER_REF}"
 ACME_HOME="${ACME_HOME:-/root/.acme.sh}"
 ACME_BIN="${ACME_HOME}/acme.sh"
 CERT_ROOT="${CERT_ROOT:-/etc/acme/certs}"
@@ -72,7 +75,7 @@ have_acme() {
 
 require_acme() {
   if ! have_acme; then
-    error "尚未安装 acme.sh，请先在菜单中选择 '安装/升级 acme.sh'。"
+    error "尚未安装 acme.sh，请先在菜单中选择 '更新/维护 -> 安装或升级 acme.sh'。"
     return 1
   fi
 }
@@ -175,6 +178,43 @@ install_or_upgrade_acme() {
   rm -f "$installer"
   error "acme.sh 安装失败。"
   return 1
+}
+
+update_manager() {
+  local timestamp installer installer_url source_url rc
+  require_root
+  command -v curl >/dev/null 2>&1 || install_dependencies || return 1
+
+  timestamp="$(date +%s)"
+  installer_url="${MANAGER_RAW_BASE}/install.sh?ts=${timestamp}"
+  source_url="${MANAGER_RAW_BASE}/acme-manager.sh?ts=${timestamp}"
+  installer="$(mktemp /tmp/acme-manager-bootstrap.XXXXXX.sh)" || return 1
+
+  info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的管理器版本..."
+  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$installer_url" -o "$installer"; then
+    rm -f "$installer"
+    error "无法下载 GitHub 引导安装器。"
+    return 1
+  fi
+  if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for acme-manager\.$' "$installer"; then
+    rm -f "$installer"
+    error "下载内容未通过安装器校验，拒绝更新。"
+    return 1
+  fi
+
+  ACME_MANAGER_REPO="$MANAGER_REPO" \
+    ACME_MANAGER_REF="$MANAGER_REF" \
+    ACME_MANAGER_SOURCE_URL="$source_url" \
+    ACME_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
+    bash "$installer" version
+  rc=$?
+  rm -f "$installer"
+
+  if (( rc != 0 )); then
+    error "acme-manager 更新失败。"
+    return "$rc"
+  fi
+  ok "acme-manager 更新完成。"
 }
 
 install_manager_binary() {
@@ -780,6 +820,7 @@ ${PROGRAM} ${VERSION}
 
 用法：
   ${PROGRAM}                    打开交互菜单
+  ${PROGRAM} update-manager     从 GitHub 更新 acme-manager
   ${PROGRAM} status             查看证书和自动续期状态
   ${PROGRAM} renew-all          检查并续期所有到期证书
   ${PROGRAM} renew-all --force  强制续期所有证书（谨慎使用）
@@ -798,8 +839,65 @@ EOF
 
 banner() {
   [[ -t 1 ]] && clear || true
-  printf '%s%sacme-manager %s%s\n' "$C_BOLD" "$C_CYAN" "$VERSION" "$C_RESET"
+  printf '%s%s' "$C_BOLD" "$C_CYAN"
+  cat <<'EOF'
+ __  __  ____           _      ____  __  __  _____
+|  \/  || __ )         / \    / ___||  \/  || ____|
+| |\/| ||  _ \  _____ / _ \  | |   | |\/| ||  _|
+| |  | || |_) ||_____/ ___ \ | |___| |  | || |___
+|_|  |_||____/      /_/   \_\ \____||_|  |_||_____|
+EOF
+  printf '%s' "$C_RESET"
+  printf '%sacme-manager %s%s\n' "$C_BOLD" "$VERSION" "$C_RESET"
   printf "安全地申请、部署和续期 Let's Encrypt ECC 证书\n\n"
+}
+
+maintenance_menu() {
+  local choice
+  while true; do
+    printf '\n更新/维护：\n'
+    printf '  1. 更新 acme-manager\n'
+    printf '  2. 安装/升级官方 acme.sh\n'
+    printf '  3. 更新全部\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1)
+        if update_manager; then
+          info "正在重新载入最新版菜单..."
+          exec "$INSTALL_PATH"
+        fi
+        pause
+        ;;
+      2) install_or_upgrade_acme; pause ;;
+      3)
+        if install_or_upgrade_acme && update_manager; then
+          info "正在重新载入最新版菜单..."
+          exec "$INSTALL_PATH"
+        fi
+        pause
+        ;;
+      0) return 0 ;;
+      *) error "无效选项。" ;;
+    esac
+  done
+}
+
+advanced_menu() {
+  local choice
+  while true; do
+    printf '\n高级维护：\n'
+    printf '  1. 重新部署已有 acme.sh 证书\n'
+    printf '  2. 安装/修复自动续期任务\n'
+    printf '  0. 返回\n'
+    read -r -p "请选择：" choice
+    case "$choice" in
+      1) deploy_existing; pause ;;
+      2) setup_scheduler; pause ;;
+      0) return 0 ;;
+      *) error "无效选项。" ;;
+    esac
+  done
 }
 
 main_menu() {
@@ -814,30 +912,28 @@ main_menu() {
       printf 'acme.sh：未安装\n自动续期：未配置\n'
     fi
     printf '\n'
-    printf '  1. 安装/升级 acme.sh\n'
+    printf '  1. 更新/维护\n'
     printf '  2. 申请并部署新证书\n'
     printf '  3. 查看证书与续期状态\n'
     printf '  4. 手动续期\n'
-    printf '  5. 重新部署已有 acme.sh 证书\n'
-    printf '  6. 安装/修复自动续期任务\n'
-    printf '  7. 查看最近日志\n'
-    printf '  8. 输出指定域名的证书路径\n'
+    printf '  5. 输出指定域名的证书路径\n'
+    printf '  6. 查看最近日志\n'
+    printf '  7. 高级维护\n'
     printf '  0. 退出\n'
     read -r -p "请选择：" choice
     printf '\n'
     case "$choice" in
-      1) install_or_upgrade_acme; pause ;;
+      1) maintenance_menu ;;
       2) issue_certificate; pause ;;
       3) show_status; pause ;;
       4) manual_renew_menu; pause ;;
-      5) deploy_existing; pause ;;
-      6) setup_scheduler; pause ;;
-      7) show_log; pause ;;
-      8)
+      5)
         read -r -p "主域名：" domain
         show_paths "$domain"
         pause
         ;;
+      6) show_log; pause ;;
+      7) advanced_menu ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -848,6 +944,7 @@ main() {
   local subcommand="${1:-menu}"
   case "$subcommand" in
     menu) main_menu ;;
+    update-manager) update_manager ;;
     install) install_or_upgrade_acme ;;
     status) require_root; show_status ;;
     renew-all) shift; renew_all "$@" ;;

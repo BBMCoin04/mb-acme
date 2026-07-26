@@ -38,8 +38,8 @@ wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | 
 新 VPS 推荐按以下顺序操作：
 
 1. 执行一行安装命令。
-2. 菜单选择 `1`，安装 acme.sh，并输入真实邮箱。
-3. 菜单选择 `2`，输入主域名、附加域名和是否申请泛域名。
+2. 菜单选择 `1 -> 2`，安装 acme.sh，并输入真实邮箱。
+3. 返回主菜单选择 `2`，输入主域名、附加域名和是否申请泛域名。
 4. 选择 standalone、webroot 或 DNS API 验证。
 5. 签发成功后，按提示决定是否配置服务自动 reload。
 6. 记录脚本输出的完整证书链和私钥路径。
@@ -57,11 +57,50 @@ wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | 
 sudo acme-manager
 ```
 
+主菜单保持日常操作简洁：
+
+```text
+1. 更新/维护
+2. 申请并部署新证书
+3. 查看证书与续期状态
+4. 手动续期
+5. 输出指定域名的证书路径
+6. 查看最近日志
+7. 高级维护
+0. 退出
+```
+
+“更新/维护”可以直接更新 acme-manager、升级官方 acme.sh 或更新全部；“高级维护”包含重新部署已有证书和修复自动续期任务。
+
+### 日常更新
+
+不需要重新复制 GitHub 安装命令。进入菜单选择：
+
+```text
+1. 更新/维护
+```
+
+然后选择：
+
+```text
+1. 更新 acme-manager
+2. 安装/升级官方 acme.sh
+3. 更新全部
+```
+
+管理器更新由用户明确触发，不会无人值守更新自身。更新过程从 HTTPS 下载引导安装器和主程序，执行语法及程序标识校验，成功后自动重新载入新菜单。
+
+也可以使用 CLI：
+
+```bash
+sudo acme-manager update-manager
+```
+
 ## 支持的验证方式
 
 - `standalone`：TCP 80 必须可从公网访问。端口被占用时不会强杀进程，可选择通过 acme.sh hook 停启指定 systemd 服务。
 - `webroot`：适合已经运行 Nginx、Apache 或 Caddy 的 VPS，通常是 HTTP 场景的推荐方式。
-- `Cloudflare DNS API`：使用最小权限 API Token，支持 CDN 代理和泛域名。
+- `Cloudflare DNS API`：使用最小权限 API Token，支持 CDN 代理和泛域名。Token 需要 `Zone / DNS / Edit` 与 `Zone / Zone / Read`，资源应限定到目标 Zone。
 - `DNSPod DNS API`：使用 API ID 和 API Key，支持泛域名。
 - `Aliyun DNS API`：使用 AccessKey ID 和 AccessKey Secret，支持泛域名。
 
@@ -170,7 +209,7 @@ sudo acme-manager renew example.com --force
 ## 从旧版迁移
 
 1. 打开菜单并选择“查看证书与续期状态”。
-2. 如果 acme.sh 列表中已有域名，选择“重新部署已有 acme.sh 证书”。
+2. 如果 acme.sh 列表中已有域名，进入“高级维护”，选择“重新部署已有 acme.sh 证书”。
 3. 输入列表中的 `Main_Domain`，无需重新签发。
 4. 更新应用配置，改用 `/etc/acme/certs/<主域名>/fullchain.pem` 和 `key.pem`。
 5. 验证应用加载新证书后，再移除旧 `/root/mbca` 路径引用。
@@ -200,7 +239,7 @@ mb-acme/
 建议为稳定版本创建 Git tag。安装指定版本时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.1.1 bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.2.0 bash
 ```
 
 也可以在 fork 中覆盖默认仓库：
