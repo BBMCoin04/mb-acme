@@ -5,7 +5,7 @@ set -uo pipefail
 umask 077
 
 VERSION="1.0.0"
-DEFAULT_REPO="BBMAPI/mb-acme"
+DEFAULT_REPO="BBMCoin04/mb-acme"
 REPO="${ACME_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${ACME_MANAGER_REF:-main}"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"

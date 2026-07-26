@@ -7,19 +7,19 @@
 推荐方式（先下载、再执行，便于检查和排错）：
 
 ```bash
-curl -fsSLo /tmp/mb-acme-install.sh https://raw.githubusercontent.com/BBMAPI/mb-acme/main/install.sh && sudo bash /tmp/mb-acme-install.sh
+curl -fsSLo /tmp/mb-acme-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh && sudo bash /tmp/mb-acme-install.sh
 ```
 
 快速方式：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMAPI/mb-acme/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo bash
 ```
 
 使用 wget：
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/BBMAPI/mb-acme/main/install.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo bash
 ```
 
 `install.sh` 会执行以下步骤：
@@ -200,11 +200,11 @@ mb-acme/
 建议为稳定版本创建 Git tag。安装指定版本时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMAPI/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.1.0 bash
 ```
 
 也可以在 fork 中覆盖默认仓库：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMAPI/mb-acme/main/install.sh | sudo env ACME_MANAGER_REPO=OWNER/REPO bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REPO=OWNER/REPO bash
 ```
