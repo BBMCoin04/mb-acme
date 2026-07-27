@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-INSTALLER_VERSION="2.3.0"
+INSTALLER_VERSION="2.3.2"
 DEFAULT_REPO="BBMCoin04/mb-acme"
 REPO="${ACME_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${ACME_MANAGER_REF:-main}"
@@ -22,6 +22,7 @@ TEMP_FILE=""
 BACKUP_FILE=""
 QUICK_CREATED=0
 COMPAT_CREATED=0
+INSTALL_STARTED=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   C_RED=$'\033[31m'
@@ -43,7 +44,7 @@ cleanup() {
   [[ -z "$TEMP_FILE" ]] || rm -f -- "$TEMP_FILE"
   [[ -z "$BACKUP_FILE" ]] || rm -f -- "$BACKUP_FILE"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
 
 restore_manager() {
   if [[ -s "$BACKUP_FILE" ]]; then
@@ -53,20 +54,35 @@ restore_manager() {
   fi
 }
 
+rollback_install() {
+  (( QUICK_CREATED == 0 )) || rm -f -- "$QUICK_PATH"
+  (( COMPAT_CREATED == 0 )) || rm -f -- "$COMPAT_PATH"
+  restore_manager
+}
+
+abort_install() {
+  local exit_code="$1"
+  (( INSTALL_STARTED == 0 )) || rollback_install
+  exit "$exit_code"
+}
+trap 'abort_install 129' HUP
+trap 'abort_install 130' INT
+trap 'abort_install 143' TERM
+
 if (( EUID != 0 )); then
   error "安装需要 root 权限，请在命令前使用 sudo。"
   exit 1
 fi
-if [[ "$INSTALL_PATH" != /* || "$INSTALL_PATH" == *[[:space:]]* || "$(basename "$INSTALL_PATH")" != "acme-manager" ]]; then
-  error "管理器安装路径必须是绝对路径，并以 acme-manager 结尾。"
+if [[ "$INSTALL_PATH" != /* || ! "$INSTALL_PATH" =~ ^/[A-Za-z0-9._/@+:-]+$ || "$(basename "$INSTALL_PATH")" != "acme-manager" ]]; then
+  error "管理器安装路径必须是仅含安全字符的绝对路径，并以 acme-manager 结尾。"
   exit 1
 fi
-if [[ "$QUICK_PATH" != /* || "$QUICK_PATH" == *[[:space:]]* || "$(basename "$QUICK_PATH")" != "acme" ]]; then
-  error "主命令路径必须是绝对路径，并以 acme 结尾。"
+if [[ "$QUICK_PATH" != /* || ! "$QUICK_PATH" =~ ^/[A-Za-z0-9._/@+:-]+$ || "$(basename "$QUICK_PATH")" != "acme" ]]; then
+  error "主命令路径必须是仅含安全字符的绝对路径，并以 acme 结尾。"
   exit 1
 fi
-if [[ "$COMPAT_PATH" != /* || "$COMPAT_PATH" == *[[:space:]]* || "$(basename "$COMPAT_PATH")" != "acme-manager" ]]; then
-  error "兼容命令路径必须是绝对路径，并以 acme-manager 结尾。"
+if [[ "$COMPAT_PATH" != /* || ! "$COMPAT_PATH" =~ ^/[A-Za-z0-9._/@+:-]+$ || "$(basename "$COMPAT_PATH")" != "acme-manager" ]]; then
+  error "兼容命令路径必须是仅含安全字符的绝对路径，并以 acme-manager 结尾。"
   exit 1
 fi
 
@@ -128,31 +144,34 @@ if [[ -f "$INSTALL_PATH" ]]; then
   BACKUP_FILE="$(mktemp /tmp/acme-manager-existing.XXXXXX.sh)" || exit 1
   cp -a -- "$INSTALL_PATH" "$BACKUP_FILE" || exit 1
 fi
+INSTALL_STARTED=1
 if ! install -m 0755 "$TEMP_FILE" "$INSTALL_PATH"; then
-  restore_manager
+  rollback_install
   error "管理器安装失败，已尝试恢复原版本。"
   exit 1
 fi
 if [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]]; then
-  ln -s "$INSTALL_PATH" "$QUICK_PATH" || { restore_manager; error "无法创建主命令 ${QUICK_PATH}。"; exit 1; }
   QUICK_CREATED=1
+  if ! ln -s "$INSTALL_PATH" "$QUICK_PATH"; then
+    rollback_install
+    error "无法创建主命令 ${QUICK_PATH}。"
+    exit 1
+  fi
 fi
 if [[ ! -e "$COMPAT_PATH" && ! -L "$COMPAT_PATH" ]]; then
+  COMPAT_CREATED=1
   if ! ln -s "$INSTALL_PATH" "$COMPAT_PATH"; then
-    (( QUICK_CREATED == 0 )) || rm -f -- "$QUICK_PATH"
-    restore_manager
+    rollback_install
     error "无法创建兼容命令 ${COMPAT_PATH}。"
     exit 1
   fi
-  COMPAT_CREATED=1
 fi
 if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "acme-manager ${MANAGER_VERSION}" ]]; then
-  (( QUICK_CREATED == 0 )) || rm -f -- "$QUICK_PATH"
-  (( COMPAT_CREATED == 0 )) || rm -f -- "$COMPAT_PATH"
-  restore_manager
+  rollback_install
   error "安装后的版本自检失败，已恢复原版本。"
   exit 1
 fi
+INSTALL_STARTED=0
 
 hash_value="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || true)"
 ok "acme-manager ${MANAGER_VERSION} 已安装到 ${INSTALL_PATH}"

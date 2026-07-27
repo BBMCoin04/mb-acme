@@ -1,66 +1,30 @@
-# mb-acme / acme-manager
+# acme-manager
 
-面向 Linux VPS 的交互式 ACME 证书管理工具。基于官方 acme.sh，负责申请、部署、自动续期、手动续期和向其他部署脚本提供稳定的证书路径。当前定稿版本：`2.3.0`。
+Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署和续期 Let's Encrypt ECC 证书。当前版本：`2.3.2`。
 
-## 一行安装
+## 安装
 
-推荐方式（先下载、再执行，便于检查和排错）：
-
-```bash
-curl -fsSLo /tmp/mb-acme-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh && sudo bash /tmp/mb-acme-install.sh
-```
-
-快速方式：
+需要 root 权限：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo bash
+curl -fsSLo /tmp/mb-acme-install.sh https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh \
+  && sudo bash /tmp/mb-acme-install.sh
 ```
 
-使用 wget：
+以后运行 `sudo acme` 即可打开菜单。
 
-```bash
-wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo bash
-```
+## 第一次申请
 
-`install.sh` 会执行以下步骤：
+1. 选择 `1 -> 2`，安装或升级 `acme.sh`，输入真实邮箱。
+2. 回到主菜单，选择 `2`。
+3. 输入主域名，例如 `example.com`。
+4. 按需填写附加域名；不需要就留空。
+5. 按需申请 `*.example.com` 泛域名。
+6. 选择验证方式。
+7. 签发成功后，可填写需要自动 reload 的 systemd 服务名，例如 `nginx`；不需要就留空。
+8. 记下脚本显示的完整证书链和私钥路径。
 
-1. 只允许从 HTTPS 地址下载。
-2. 将主程序下载到临时文件。
-3. 检查文件非空、程序标识和 Bash 语法。
-4. 安装为 `/usr/local/sbin/acme-manager`。
-5. 创建主命令 `/usr/local/bin/acme` 和兼容命令 `/usr/local/bin/acme-manager`。
-6. 输出安装文件的 SHA-256（系统支持时）。
-7. 打开交互菜单。
-
-不要绕过安装器直接运行 `bash <(curl .../acme-manager.sh)`。进程替换产生的临时文件不能可靠地保存为 systemd 自动续期程序。
-
-## 使用流程
-
-新 VPS 推荐按以下顺序操作：
-
-1. 执行一行安装命令。
-2. 菜单选择 `1 -> 2`，安装 acme.sh，并输入真实邮箱。
-3. 返回主菜单选择 `2`，输入主域名、附加域名和是否申请泛域名。
-4. 选择 standalone、webroot 或 DNS API 验证。
-5. 签发成功后，按提示决定是否配置服务自动 reload。
-6. 记录脚本输出的完整证书链和私钥路径。
-7. 部署 Nginx、Caddy、Sing-box 等应用，直接引用这些路径。
-
-每一步都有中文提示、输入说明、成功/失败状态和错误去向。签发、部署和续期的详细输出会记录到：
-
-```text
-/var/log/acme-manager/renew.log
-```
-
-重新打开菜单：
-
-```bash
-sudo acme
-```
-
-`sudo acme-manager` 继续作为兼容命令使用。
-
-主菜单保持日常操作简洁：
+如果仅服务 reload 失败，但证书文件已经写入，脚本会继续完成部署和续期配置，并提示你稍后手动 reload。
 
 ```text
 1. 更新/维护
@@ -70,190 +34,71 @@ sudo acme
 5. 输出指定域名的证书路径
 6. 查看最近日志
 7. 高级维护
-8. 保守系统清理
 0. 退出
 ```
 
-“更新/维护”可以直接更新 acme-manager、升级官方 acme.sh 或更新全部；“高级维护”包含重新部署已有证书和修复自动续期任务。
+## 验证方式
 
-### 日常更新
+- `standalone`：没有网站服务占用 80 端口时使用。
+- `webroot`：已经运行 Nginx、Apache 或 Caddy，通常优先选它。
+- `Cloudflare DNS API`：域名使用 Cloudflare。
+- `DNSPod DNS API`：域名使用 DNSPod。
+- `Aliyun DNS API`：域名使用阿里云 DNS。
 
-不需要重新复制 GitHub 安装命令。进入菜单选择：
+泛域名必须使用 DNS API。DNS 凭据输入时不会显示，但 `acme.sh` 会把续期所需凭据保存在 root 专用配置中。
 
-```text
-1. 更新/维护
-```
+## 证书路径
 
-然后选择：
-
-```text
-1. 更新 acme-manager
-2. 安装/升级官方 acme.sh
-3. 更新全部
-```
-
-管理器更新由用户明确触发，不会无人值守更新自身。更新过程从 HTTPS 下载引导安装器和主程序，执行语法及程序标识校验，成功后自动重新载入新菜单。
-
-也可以使用 CLI：
-
-```bash
-sudo acme update-manager
-```
-
-## 支持的验证方式
-
-- `standalone`：TCP 80 必须可从公网访问。端口被占用时不会强杀进程，可选择通过 acme.sh hook 停启指定 systemd 服务。
-- `webroot`：适合已经运行 Nginx、Apache 或 Caddy 的 VPS，通常是 HTTP 场景的推荐方式。
-- `Cloudflare DNS API`：使用最小权限 API Token，支持 CDN 代理和泛域名。Token 需要 `Zone / DNS / Edit` 与 `Zone / Zone / Read`，资源应限定到目标 Zone。
-- `DNSPod DNS API`：使用 API ID 和 API Key，支持泛域名。
-- `Aliyun DNS API`：使用 AccessKey ID 和 AccessKey Secret，支持泛域名。
-
-泛域名证书必须使用 DNS API。DNS 验证不要求 A/AAAA 记录指向本机。
-
-## 固定证书路径
-
-每张证书按主域名单独部署：
+每个主域名单独保存在 `/etc/acme/certs/<主域名>/`：
 
 ```text
-/etc/acme/certs/<主域名>/cert.pem
-/etc/acme/certs/<主域名>/ca.pem
-/etc/acme/certs/<主域名>/fullchain.pem
-/etc/acme/certs/<主域名>/key.pem
-/etc/acme/certs/<主域名>/paths.env
+cert.pem       单张证书
+ca.pem         CA 证书
+fullchain.pem  完整证书链，通常使用这个
+key.pem        私钥
+paths.env      路径变量
 ```
 
-兼容文件名：
+例如：
 
 ```text
-/etc/acme/certs/<主域名>/cert.crt -> fullchain.pem
-/etc/acme/certs/<主域名>/private.key -> key.pem
+/etc/acme/certs/example.com/fullchain.pem
+/etc/acme/certs/example.com/key.pem
 ```
 
-不要让应用直接读取 `/root/.acme.sh` 中的内部文件。acme.sh 续期成功后会自动更新 `/etc/acme/certs` 中的生产文件，并执行已配置的 reload 命令。
-
-## 给其他脚本调用
-
-输出一个域名的全部路径变量：
+查询路径：
 
 ```bash
 sudo acme paths example.com
-```
-
-输出格式稳定，可直接加载：
-
-```bash
-source "$(sudo acme path example.com env)"
-printf '%s\n' "$ACME_FULLCHAIN_FILE"
-printf '%s\n' "$ACME_KEY_FILE"
-```
-
-只取得一个路径：
-
-```bash
 sudo acme path example.com fullchain
 sudo acme path example.com key
 ```
 
-支持的路径类型：`cert`、`ca`、`fullchain`、`key`、`env`。目标证书不存在时命令返回非零状态，方便下游脚本立即终止。
+不要让 Nginx、Sing-box 等程序直接读取 `/root/.acme.sh` 中的内部文件。
 
-### Sing-box 脚本示例
+## 续期与维护
 
-部署脚本以 root 运行时：
-
-```bash
-DOMAIN="example.com"
-CERT_FILE="$(acme path "$DOMAIN" fullchain)"
-KEY_FILE="$(acme path "$DOMAIN" key)"
-
-[[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] || {
-  echo "证书或私钥不存在" >&2
-  exit 1
-}
-```
-
-写入 Sing-box JSON 时使用：
-
-```json
-{
-  "tls": {
-    "enabled": true,
-    "certificate_path": "/etc/acme/certs/example.com/fullchain.pem",
-    "key_path": "/etc/acme/certs/example.com/key.pem"
-  }
-}
-```
-
-私钥默认权限为 `0600`。如果 Sing-box 使用非 root 用户运行，应通过专用用户组授予最小读取权限，不要把私钥改成全局可读。
-
-## 自动与手动续期
-
-首次成功部署后会自动配置续期：
-
-- systemd 系统：每 6 小时检查一次，附加最多 1 小时随机延迟。
-- 非 systemd 系统：通过 `/etc/cron.d/acme-manager` 每天 `03:17` 检查。
-- 已有有效 acme.sh 原生 cron：直接复用，不创建重复任务。
-
-acme.sh 只会续期已经进入续期窗口的证书，不会每次检查都重新签发。
-
-常用命令：
+首次成功部署后会自动配置续期：systemd 每 6 小时检查一次；非 systemd 系统使用已有的 `cron/crond`。已有 `acme.sh` cron 时不会重复创建任务。cron 未运行或状态无法检测时只会提示，不会阻断配置。
 
 ```bash
-sudo acme status
-sudo acme renew-all
-sudo acme renew example.com
-sudo acme scheduler
+sudo acme status                 # 查看证书和续期状态
+sudo acme renew-all              # 检查全部证书
+sudo acme renew example.com      # 检查指定证书
+sudo acme scheduler              # 安装或修复自动续期
+sudo acme doctor                 # 运行诊断
 ```
 
-强制续期只用于排障或验证部署链路，可能消耗 CA 的重复签发额度：
+只有排障时才使用 `sudo acme renew example.com --force`，否则可能触发 Let's Encrypt 限频。
 
-```bash
-sudo acme renew example.com --force
-```
+更新脚本或 `acme.sh`：菜单选择 `1`。已有证书需要重新部署：菜单选择 `7 -> 1`，不必重新申请。
 
-## 保守系统清理
+日志位于 `/var/log/acme-manager/renew.log`，超过 5 MiB 后自动保留最近 2000 行。
 
-菜单 `8` 或命令 `sudo acme cleanup-system` 会先展示范围并要求确认，只清理软件包下载缓存、按系统策略过期的临时文件、14 天前的 systemd journal，以及超过 5 MiB 的管理器日志旧记录。
+## 安全说明
 
-不会执行 `autoremove`、Docker prune、证书/密钥删除、用户目录扫描、防火墙清空或手工批量删除。
-
-## 从旧版迁移
-
-1. 打开菜单并选择“查看证书与续期状态”。
-2. 如果 acme.sh 列表中已有域名，进入“高级维护”，选择“重新部署已有 acme.sh 证书”。
-3. 输入列表中的 `Main_Domain`，无需重新签发。
-4. 更新应用配置，改用 `/etc/acme/certs/<主域名>/fullchain.pem` 和 `key.pem`。
-5. 验证应用加载新证书后，再移除旧 `/root/mbca` 路径引用。
-
-旧脚本可能在 root 用户 crontab 中留下包含 `root bash ~/.acme.sh/acme.sh --cron` 的无效条目。新程序能识别它不是有效的用户 cron，但不会擅自修改已有 crontab；迁移确认后可用 `sudo crontab -e` 手动删除。
-
-## 安全变化
-
-- 不使用 `curl -k` 或 acme.sh `--insecure`。
-- 不修改 `/etc/resolv.conf`、WARP、系统软件源或网络配置。
-- 不使用 `kill -9` 清空 80 端口。
-- 不生成虚假邮箱。
-- 不在每次签发前卸载重装 acme.sh。
-- Cloudflare 使用 API Token，不要求 Global API Key。
-- DNS 凭据输入时不回显，也不会写入命令参数和管理器日志。为支持无人值守续期，acme.sh 会按其官方机制把所需凭据保存在 root 专用的 `/root/.acme.sh/account.conf`。
-- 每个域名单独保存，避免多张证书覆盖同一文件。
-
-## 仓库文件
-
-```text
-mb-acme/
-├── README.md
-├── install.sh
-└── acme-manager.sh
-```
-
-建议为稳定版本创建 Git tag。安装指定版本时：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.3.0 bash
-```
-
-也可以在 fork 中覆盖默认仓库：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REPO=OWNER/REPO bash
-```
+- 私钥权限默认为 `0600`，不要改成全局可读。
+- 不使用 `curl -k` 或 `--insecure`。
+- 不修改 DNS、软件源、防火墙或其他网络配置。
+- 不会强制结束占用 80 端口的进程。
+- 不包含软件包缓存、Docker、journal 或临时文件清理功能。
+- 个人使用默认信任 HTTPS 和 GitHub 仓库，不做签名校验；安装器仍会检查文件和 Bash 语法并输出 SHA-256。
