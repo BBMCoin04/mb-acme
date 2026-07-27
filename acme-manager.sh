@@ -4,9 +4,11 @@
 set -uo pipefail
 umask 077
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
+QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
+COMPAT_PATH="${ACME_MANAGER_COMPAT_PATH:-/usr/local/bin/acme-manager}"
 MANAGER_REPO="${ACME_MANAGER_REPO:-BBMCoin04/mb-acme}"
 MANAGER_REF="${ACME_MANAGER_REF:-main}"
 MANAGER_RAW_BASE="https://raw.githubusercontent.com/${MANAGER_REPO}/${MANAGER_REF}"
@@ -15,7 +17,11 @@ ACME_BIN="${ACME_HOME}/acme.sh"
 CERT_ROOT="${CERT_ROOT:-/etc/acme/certs}"
 LOG_ROOT="${LOG_ROOT:-/var/log/acme-manager}"
 LOG_FILE="${LOG_ROOT}/renew.log"
-LOCK_FILE="/run/lock/acme-manager.lock"
+LOCK_FILE="${ACME_MANAGER_LOCK_FILE:-/run/lock/acme-manager.lock}"
+SYSTEMD_UNIT_DIR="${ACME_MANAGER_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+RENEW_SERVICE_FILE="${SYSTEMD_UNIT_DIR}/acme-manager-renew.service"
+RENEW_TIMER_FILE="${SYSTEMD_UNIT_DIR}/acme-manager-renew.timer"
+CRON_FILE="${ACME_MANAGER_CRON_FILE:-/etc/cron.d/acme-manager}"
 SERVER="letsencrypt"
 SELF_PATH="${BASH_SOURCE[0]}"
 if [[ -f "$SELF_PATH" ]]; then
@@ -64,9 +70,33 @@ require_root() {
 }
 
 ensure_directories() {
-  install -d -m 0700 "$LOG_ROOT"
-  install -d -m 0750 "$CERT_ROOT"
-  install -d -m 0755 "$(dirname "$LOCK_FILE")"
+  install -d -m 0700 "$LOG_ROOT" &&
+    install -d -m 0750 "$CERT_ROOT" &&
+    install -d -m 0755 "$(dirname "$LOCK_FILE")"
+}
+
+atomic_install_file() {
+  local source="$1" target="$2" mode="$3" temporary
+  temporary="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX")" || return 1
+  if ! install -m "$mode" "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+validate_manager_paths() {
+  [[ "$INSTALL_PATH" == /* && "$INSTALL_PATH" != *[[:space:]]* && "$(basename "$INSTALL_PATH")" == "acme-manager" ]] || {
+    error "管理器安装路径必须是绝对路径，并以 acme-manager 结尾。"
+    return 1
+  }
+  [[ "$QUICK_PATH" == /* && "$QUICK_PATH" != *[[:space:]]* && "$(basename "$QUICK_PATH")" == "acme" ]] || {
+    error "主命令路径必须是绝对路径，并以 acme 结尾。"
+    return 1
+  }
+  [[ "$COMPAT_PATH" == /* && "$COMPAT_PATH" != *[[:space:]]* && "$(basename "$COMPAT_PATH")" == "acme-manager" ]] || {
+    error "兼容命令路径必须是绝对路径，并以 acme-manager 结尾。"
+    return 1
+  }
 }
 
 have_acme() {
@@ -163,6 +193,11 @@ install_or_upgrade_acme() {
     error "无法从 https://get.acme.sh 下载官方安装器。"
     return 1
   fi
+  if ! sh -n "$installer"; then
+    rm -f -- "$installer"
+    error "acme.sh 官方安装器未通过 Shell 语法检查，拒绝执行。"
+    return 1
+  fi
 
   info "正在安装 acme.sh 到 ${ACME_HOME}..."
   if sh "$installer" "email=${email}" --home "$ACME_HOME" --nocron --noprofile; then
@@ -206,6 +241,8 @@ update_manager() {
     ACME_MANAGER_REF="$MANAGER_REF" \
     ACME_MANAGER_SOURCE_URL="$source_url" \
     ACME_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
+    ACME_MANAGER_QUICK_PATH="$QUICK_PATH" \
+    ACME_MANAGER_COMPAT_PATH="$COMPAT_PATH" \
     bash "$installer" version
   rc=$?
   rm -f "$installer"
@@ -217,17 +254,43 @@ update_manager() {
   ok "acme-manager 更新完成。"
 }
 
+install_command_alias() {
+  local path="$1" label="$2"
+  install -d -m 0755 "$(dirname "$path")" || return 1
+  if [[ -e "$path" || -L "$path" ]]; then
+    if [[ "$(readlink -f "$path" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
+      error "${label}路径已被其他程序占用：${path}"
+      return 1
+    fi
+  else
+    ln -s "$INSTALL_PATH" "$path" || return 1
+  fi
+}
+
 install_manager_binary() {
-  install -d -m 0755 "$(dirname "$INSTALL_PATH")"
+  local installed_version=""
+  validate_manager_paths || return 1
+  install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
-    chmod 0755 "$INSTALL_PATH"
+    chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    install -m 0755 "$SELF_PATH" "$INSTALL_PATH"
+    if [[ -x "$INSTALL_PATH" ]]; then
+      installed_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+    fi
+    if [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+       [[ "$(printf '%s\n' "$VERSION" "$installed_version" | sort -V | head -n 1)" == "$VERSION" ]] &&
+       [[ "$installed_version" != "$VERSION" ]]; then
+      warn "固定管理器 ${installed_version} 新于当前脚本 ${VERSION}，不会用旧脚本覆盖。"
+    else
+      atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
+    fi
   else
     error "当前脚本来自临时数据流，无法安装自动续期所需的固定副本。"
     error "请改用仓库中的 install.sh 引导安装器。"
     return 1
   fi
+  install_command_alias "$QUICK_PATH" "主命令" || return 1
+  install_command_alias "$COMPAT_PATH" "兼容命令" || return 1
 }
 
 native_acme_cron_present() {
@@ -240,18 +303,22 @@ native_acme_cron_present() {
 }
 
 setup_scheduler() {
+  local service_candidate="" timer_candidate="" cron_candidate=""
   require_root
   require_acme || return 1
-  ensure_directories
+  ensure_directories || return 1
   install_manager_binary || return 1
 
-  if [[ ! -f /etc/systemd/system/acme-manager-renew.timer && ! -f /etc/cron.d/acme-manager ]] && native_acme_cron_present; then
+  if [[ ! -f "$RENEW_TIMER_FILE" && ! -f "$CRON_FILE" ]] && native_acme_cron_present; then
     ok "检测到有效的 acme.sh 原生 cron，继续使用现有自动续期，不重复创建任务。"
     return 0
   fi
 
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
-    cat > /etc/systemd/system/acme-manager-renew.service <<EOF
+    install -d -m 0755 "$SYSTEMD_UNIT_DIR" || return 1
+    service_candidate="$(mktemp /tmp/acme-renew-service.XXXXXX)" || return 1
+    timer_candidate="$(mktemp /tmp/acme-renew-timer.XXXXXX)" || { rm -f -- "$service_candidate"; return 1; }
+    cat > "$service_candidate" <<EOF
 [Unit]
 Description=Renew ACME certificates managed by acme-manager
 Wants=network-online.target
@@ -262,7 +329,7 @@ Type=oneshot
 ExecStart=${INSTALL_PATH} renew-all --auto
 EOF
 
-    cat > /etc/systemd/system/acme-manager-renew.timer <<'EOF'
+    cat > "$timer_candidate" <<'EOF'
 [Unit]
 Description=Check ACME certificate renewal every six hours
 
@@ -275,26 +342,35 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-    if systemctl daemon-reload && systemctl enable --now acme-manager-renew.timer; then
-      rm -f /etc/cron.d/acme-manager
+    if atomic_install_file "$service_candidate" "$RENEW_SERVICE_FILE" 0644 &&
+       atomic_install_file "$timer_candidate" "$RENEW_TIMER_FILE" 0644 &&
+       systemctl daemon-reload && systemctl enable --now acme-manager-renew.timer; then
+      rm -f -- "$service_candidate" "$timer_candidate" "$CRON_FILE"
       ok "自动续期已启用：systemd timer 每 6 小时检查一次。"
       return 0
     fi
+    rm -f -- "$service_candidate" "$timer_candidate"
     error "systemd timer 配置失败。"
     return 1
   fi
 
-  cat > /etc/cron.d/acme-manager <<EOF
+  install -d -m 0755 "$(dirname "$CRON_FILE")" || return 1
+  cron_candidate="$(mktemp /tmp/acme-renew-cron.XXXXXX)" || return 1
+  cat > "$cron_candidate" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 17 3 * * * root ${INSTALL_PATH} renew-all --auto
 EOF
-  chmod 0644 /etc/cron.d/acme-manager
+  if ! atomic_install_file "$cron_candidate" "$CRON_FILE" 0644; then
+    rm -f -- "$cron_candidate"
+    return 1
+  fi
+  rm -f -- "$cron_candidate"
   ok "自动续期已启用：cron 每天 03:17 检查一次。"
 }
 
 scheduler_status() {
-  if command -v systemctl >/dev/null 2>&1 && [[ -f /etc/systemd/system/acme-manager-renew.timer ]]; then
+  if command -v systemctl >/dev/null 2>&1 && [[ -f "$RENEW_TIMER_FILE" ]]; then
     if systemctl is-enabled --quiet acme-manager-renew.timer 2>/dev/null; then
       printf '自动续期：systemd timer 已启用'
       if systemctl is-active --quiet acme-manager-renew.timer 2>/dev/null; then
@@ -304,7 +380,7 @@ scheduler_status() {
     else
       printf '自动续期：systemd timer 未启用\n'
     fi
-  elif [[ -f /etc/cron.d/acme-manager ]]; then
+  elif [[ -f "$CRON_FILE" ]]; then
     printf '自动续期：cron 已配置\n'
   elif native_acme_cron_present; then
     printf '自动续期：acme.sh 原生 cron 已配置\n'
@@ -595,8 +671,8 @@ print_integration_hint() {
   cert_dir="${CERT_ROOT}/${domain}"
   printf '\n%s给其他部署脚本使用%s\n' "$C_BOLD" "$C_RESET"
   printf '  环境文件：source %s/paths.env\n' "$cert_dir"
-  printf '  完整证书：%s path %s fullchain\n' "$INSTALL_PATH" "$domain"
-  printf '  私钥路径：%s path %s key\n' "$INSTALL_PATH" "$domain"
+  printf '  完整证书：%s path %s fullchain\n' "$QUICK_PATH" "$domain"
+  printf '  私钥路径：%s path %s key\n' "$QUICK_PATH" "$domain"
   printf '\nSing-box TLS 配置路径：\n'
   printf '  "certificate_path": "%s/fullchain.pem"\n' "$cert_dir"
   printf '  "key_path": "%s/key.pem"\n' "$cert_dir"
@@ -737,6 +813,7 @@ renew_domain() {
   local domain force="${2:-}"
   require_root
   require_acme || return 1
+  [[ -z "$force" || "$force" == "--force" ]] || { error "未知参数：${force}"; return 2; }
   domain="${1:-}"
   domain="${domain,,}"
   if [[ "$domain" == \*.* ]] || ! validate_domain "$domain"; then
@@ -814,23 +891,124 @@ show_log() {
   fi
 }
 
+trim_manager_log_if_large() {
+  local size temporary
+  [[ -f "$LOG_FILE" ]] || return 0
+  size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
+  [[ "$size" =~ ^[0-9]+$ ]] || size=0
+  (( size > 5 * 1024 * 1024 )) || return 0
+  temporary="$(mktemp "${LOG_ROOT}/.renew-log.XXXXXX")" || return 1
+  if ! tail -n 2000 "$LOG_FILE" > "$temporary" || ! atomic_install_file "$temporary" "$LOG_FILE" 0600; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  rm -f -- "$temporary"
+  ok "管理器续期日志超过 5 MiB，已保留最近 2000 行。"
+}
+
+safe_system_cleanup() {
+  local before_kb after_kb freed_kb actions=0 failures=0
+  require_root
+  printf '\n%s保守系统清理范围%s\n' "$C_BOLD" "$C_RESET"
+  printf '  - 清理 apt/dnf/yum/apk 下载缓存（不卸载软件）\n'
+  printf '  - 按 systemd-tmpfiles 系统策略清理过期临时文件\n'
+  printf '  - 清理 14 天以前的 systemd journal 归档\n'
+  printf '  - renew.log 超过 5 MiB 时保留最近 2000 行\n'
+  printf '明确不会执行：autoremove、Docker prune、证书/密钥删除、用户目录扫描、防火墙清空。\n'
+  confirm "确认执行以上保守清理？" || return 0
+
+  before_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $3}' || printf '0')"
+  if command -v apt-get >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    apt-get clean || failures=$((failures + 1))
+  elif command -v dnf >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    dnf clean all || failures=$((failures + 1))
+  elif command -v yum >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    yum clean all || failures=$((failures + 1))
+  elif command -v apk >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    apk cache clean || failures=$((failures + 1))
+  else
+    info "未识别到受支持的包管理器，跳过软件包缓存。"
+  fi
+
+  if command -v systemd-tmpfiles >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    systemd-tmpfiles --clean || failures=$((failures + 1))
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    actions=$((actions + 1))
+    journalctl --vacuum-time=14d || failures=$((failures + 1))
+  fi
+  actions=$((actions + 1))
+  trim_manager_log_if_large || failures=$((failures + 1))
+
+  after_kb="$(df -Pk / 2>/dev/null | awk 'NR==2 {print $3}' || printf '0')"
+  if [[ "$before_kb" =~ ^[0-9]+$ && "$after_kb" =~ ^[0-9]+$ && "$before_kb" -ge "$after_kb" ]]; then
+    freed_kb=$((before_kb - after_kb))
+  else
+    freed_kb=0
+  fi
+  if (( failures == 0 )); then
+    ok "保守系统清理完成，共执行 ${actions} 项，约释放 $((freed_kb / 1024)) MiB。"
+  else
+    warn "保守系统清理完成，但 ${failures}/${actions} 项失败；未执行激进删除。"
+    return 1
+  fi
+}
+
+doctor() {
+  local installed_version="未安装" installed_hash="未知" quick_target="不存在" compat_target="不存在"
+  local acme_version="未安装" cert_count=0 log_size=0
+  [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
+  [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
+  [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
+  [[ ! -e "$COMPAT_PATH" && ! -L "$COMPAT_PATH" ]] || compat_target="$(readlink -f "$COMPAT_PATH" 2>/dev/null || printf '无法解析')"
+  if have_acme; then
+    acme_version="$($ACME_BIN --version 2>/dev/null | tail -n 1 || printf '无法读取')"
+  fi
+  if [[ -d "$CERT_ROOT" ]]; then
+    cert_count="$(find "$CERT_ROOT" -mindepth 2 -maxdepth 2 -type f -name fullchain.pem 2>/dev/null | wc -l)"
+  fi
+  [[ ! -f "$LOG_FILE" ]] || log_size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
+
+  printf '管理器当前进程：%s %s\n' "$PROGRAM" "$VERSION"
+  printf '固定安装文件：%s（%s）\n' "$INSTALL_PATH" "$installed_version"
+  printf '主命令目标：%s -> %s\n' "$QUICK_PATH" "$quick_target"
+  printf '兼容命令目标：%s -> %s\n' "$COMPAT_PATH" "$compat_target"
+  printf '安装文件 SHA-256：%s\n' "$installed_hash"
+  printf 'acme.sh：%s\n' "$acme_version"
+  printf '证书目录：%s（已部署 %s 张）\n' "$CERT_ROOT" "$cert_count"
+  printf '续期日志：%s（%s 字节）\n' "$LOG_FILE" "$log_size"
+  scheduler_status
+  printf '命令解析：\n'
+  type -a acme 2>/dev/null || true
+  type -a acme-manager 2>/dev/null || true
+}
+
 show_help() {
   cat <<EOF
 ${PROGRAM} ${VERSION}
 
 用法：
-  ${PROGRAM}                    打开交互菜单
-  ${PROGRAM} update-manager     从 GitHub 更新 acme-manager
-  ${PROGRAM} status             查看证书和自动续期状态
-  ${PROGRAM} renew-all          检查并续期所有到期证书
-  ${PROGRAM} renew-all --force  强制续期所有证书（谨慎使用）
-  ${PROGRAM} renew DOMAIN       检查指定 ECC 证书
-  ${PROGRAM} renew DOMAIN --force
-  ${PROGRAM} scheduler          安装/修复自动续期任务
-  ${PROGRAM} paths DOMAIN       输出可供 source 的证书路径变量
-  ${PROGRAM} path DOMAIN TYPE   仅输出一个路径；TYPE: cert/ca/fullchain/key/env
-  ${PROGRAM} install            安装或升级 acme.sh
-  ${PROGRAM} version
+  acme                    打开交互菜单
+  acme update-manager     从 GitHub 更新 acme-manager
+  acme status             查看证书和自动续期状态
+  acme renew-all          检查并续期所有到期证书
+  acme renew-all --force  强制续期所有证书（谨慎使用）
+  acme renew DOMAIN       检查指定 ECC 证书
+  acme renew DOMAIN --force
+  acme scheduler          安装/修复自动续期任务
+  acme paths DOMAIN       输出可供 source 的证书路径变量
+  acme path DOMAIN TYPE   仅输出一个路径；TYPE: cert/ca/fullchain/key/env
+  acme doctor             检查版本、命令入口和续期状态
+  acme cleanup-system     执行带确认的保守系统清理
+  acme install            安装或升级 acme.sh
+  acme version
+
+兼容命令：acme-manager
 
 证书默认部署到：${CERT_ROOT}/<主域名>/
 自动续期日志：  ${LOG_FILE}
@@ -889,11 +1067,13 @@ advanced_menu() {
     printf '\n高级维护：\n'
     printf '  1. 重新部署已有 acme.sh 证书\n'
     printf '  2. 安装/修复自动续期任务\n'
+    printf '  3. 运行安装与续期诊断\n'
     printf '  0. 返回\n'
     read -r -p "请选择：" choice
     case "$choice" in
       1) deploy_existing; pause ;;
       2) setup_scheduler; pause ;;
+      3) doctor; pause ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
     esac
@@ -903,6 +1083,7 @@ advanced_menu() {
 main_menu() {
   local choice domain
   require_root
+  install_manager_binary || return 1
   while true; do
     banner
     if have_acme; then
@@ -919,6 +1100,7 @@ main_menu() {
     printf '  5. 输出指定域名的证书路径\n'
     printf '  6. 查看最近日志\n'
     printf '  7. 高级维护\n'
+    printf '  8. 保守系统清理\n'
     printf '  0. 退出\n'
     read -r -p "请选择：" choice
     printf '\n'
@@ -934,6 +1116,7 @@ main_menu() {
         ;;
       6) show_log; pause ;;
       7) advanced_menu ;;
+      8) safe_system_cleanup; pause ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -950,6 +1133,8 @@ main() {
     renew-all) shift; renew_all "$@" ;;
     renew) shift; renew_domain "${1:-}" "${2:-}" ;;
     scheduler) setup_scheduler ;;
+    doctor) require_root; doctor ;;
+    cleanup-system) safe_system_cleanup ;;
     paths) require_root; show_paths "${2:-}" ;;
     path) require_root; show_single_path "${2:-}" "${3:-}" ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
@@ -958,4 +1143,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${ACME_MANAGER_NO_MAIN:-0}" != "1" ]]; then
+  main "$@"
+fi

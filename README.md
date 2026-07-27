@@ -1,6 +1,6 @@
 # mb-acme / acme-manager
 
-面向 Linux VPS 的交互式 ACME 证书管理工具。基于官方 acme.sh，负责申请、部署、自动续期、手动续期和向其他部署脚本提供稳定的证书路径。
+面向 Linux VPS 的交互式 ACME 证书管理工具。基于官方 acme.sh，负责申请、部署、自动续期、手动续期和向其他部署脚本提供稳定的证书路径。当前定稿版本：`2.3.0`。
 
 ## 一行安装
 
@@ -28,8 +28,9 @@ wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | 
 2. 将主程序下载到临时文件。
 3. 检查文件非空、程序标识和 Bash 语法。
 4. 安装为 `/usr/local/sbin/acme-manager`。
-5. 输出安装文件的 SHA-256（系统支持时）。
-6. 重新连接当前终端并打开交互菜单。
+5. 创建主命令 `/usr/local/bin/acme` 和兼容命令 `/usr/local/bin/acme-manager`。
+6. 输出安装文件的 SHA-256（系统支持时）。
+7. 打开交互菜单。
 
 不要绕过安装器直接运行 `bash <(curl .../acme-manager.sh)`。进程替换产生的临时文件不能可靠地保存为 systemd 自动续期程序。
 
@@ -54,8 +55,10 @@ wget -qO- https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | 
 重新打开菜单：
 
 ```bash
-sudo acme-manager
+sudo acme
 ```
+
+`sudo acme-manager` 继续作为兼容命令使用。
 
 主菜单保持日常操作简洁：
 
@@ -67,6 +70,7 @@ sudo acme-manager
 5. 输出指定域名的证书路径
 6. 查看最近日志
 7. 高级维护
+8. 保守系统清理
 0. 退出
 ```
 
@@ -93,7 +97,7 @@ sudo acme-manager
 也可以使用 CLI：
 
 ```bash
-sudo acme-manager update-manager
+sudo acme update-manager
 ```
 
 ## 支持的验证方式
@@ -132,13 +136,13 @@ sudo acme-manager update-manager
 输出一个域名的全部路径变量：
 
 ```bash
-sudo acme-manager paths example.com
+sudo acme paths example.com
 ```
 
 输出格式稳定，可直接加载：
 
 ```bash
-source "$(sudo acme-manager path example.com env)"
+source "$(sudo acme path example.com env)"
 printf '%s\n' "$ACME_FULLCHAIN_FILE"
 printf '%s\n' "$ACME_KEY_FILE"
 ```
@@ -146,8 +150,8 @@ printf '%s\n' "$ACME_KEY_FILE"
 只取得一个路径：
 
 ```bash
-sudo acme-manager path example.com fullchain
-sudo acme-manager path example.com key
+sudo acme path example.com fullchain
+sudo acme path example.com key
 ```
 
 支持的路径类型：`cert`、`ca`、`fullchain`、`key`、`env`。目标证书不存在时命令返回非零状态，方便下游脚本立即终止。
@@ -158,8 +162,8 @@ sudo acme-manager path example.com key
 
 ```bash
 DOMAIN="example.com"
-CERT_FILE="$(acme-manager path "$DOMAIN" fullchain)"
-KEY_FILE="$(acme-manager path "$DOMAIN" key)"
+CERT_FILE="$(acme path "$DOMAIN" fullchain)"
+KEY_FILE="$(acme path "$DOMAIN" key)"
 
 [[ -s "$CERT_FILE" && -s "$KEY_FILE" ]] || {
   echo "证书或私钥不存在" >&2
@@ -194,17 +198,23 @@ acme.sh 只会续期已经进入续期窗口的证书，不会每次检查都重
 常用命令：
 
 ```bash
-sudo acme-manager status
-sudo acme-manager renew-all
-sudo acme-manager renew example.com
-sudo acme-manager scheduler
+sudo acme status
+sudo acme renew-all
+sudo acme renew example.com
+sudo acme scheduler
 ```
 
 强制续期只用于排障或验证部署链路，可能消耗 CA 的重复签发额度：
 
 ```bash
-sudo acme-manager renew example.com --force
+sudo acme renew example.com --force
 ```
+
+## 保守系统清理
+
+菜单 `8` 或命令 `sudo acme cleanup-system` 会先展示范围并要求确认，只清理软件包下载缓存、按系统策略过期的临时文件、14 天前的 systemd journal，以及超过 5 MiB 的管理器日志旧记录。
+
+不会执行 `autoremove`、Docker prune、证书/密钥删除、用户目录扫描、防火墙清空或手工批量删除。
 
 ## 从旧版迁移
 
@@ -224,7 +234,7 @@ sudo acme-manager renew example.com --force
 - 不生成虚假邮箱。
 - 不在每次签发前卸载重装 acme.sh。
 - Cloudflare 使用 API Token，不要求 Global API Key。
-- DNS 凭据输入时不回显，也不会写入命令参数和管理器日志。
+- DNS 凭据输入时不回显，也不会写入命令参数和管理器日志。为支持无人值守续期，acme.sh 会按其官方机制把所需凭据保存在 root 专用的 `/root/.acme.sh/account.conf`。
 - 每个域名单独保存，避免多张证书覆盖同一文件。
 
 ## 仓库文件
@@ -239,7 +249,7 @@ mb-acme/
 建议为稳定版本创建 Git tag。安装指定版本时：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.2.0 bash
+curl -fsSL https://raw.githubusercontent.com/BBMCoin04/mb-acme/main/install.sh | sudo env ACME_MANAGER_REF=v2.3.0 bash
 ```
 
 也可以在 fork 中覆盖默认仓库：
