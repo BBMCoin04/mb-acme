@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-INSTALLER_VERSION="2.3.2"
+INSTALLER_VERSION="2.3.3"
 DEFAULT_REPO="BBMCoin04/mb-acme"
 REPO="${ACME_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${ACME_MANAGER_REF:-main}"
@@ -124,7 +124,7 @@ MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
 [[ "$MANAGER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { error "无法识别管理器版本，拒绝安装。"; exit 1; }
 
 if [[ -x "$INSTALL_PATH" ]]; then
-  EXISTING_VERSION="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+  EXISTING_VERSION="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
   if [[ "$EXISTING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
      [[ "$(printf '%s\n' "$EXISTING_VERSION" "$MANAGER_VERSION" | sort -V | head -n 1)" != "$EXISTING_VERSION" ]]; then
     error "拒绝用 ${MANAGER_VERSION} 覆盖已安装的新版本 ${EXISTING_VERSION}。"
@@ -166,7 +166,7 @@ if [[ ! -e "$COMPAT_PATH" && ! -L "$COMPAT_PATH" ]]; then
     exit 1
   fi
 fi
-if [[ "$("$INSTALL_PATH" version 2>/dev/null)" != "acme-manager ${MANAGER_VERSION}" ]]; then
+if [[ "$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null)" != "acme-manager ${MANAGER_VERSION}" ]]; then
   rollback_install
   error "安装后的版本自检失败，已恢复原版本。"
   exit 1

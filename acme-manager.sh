@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="2.3.2"
+VERSION="2.3.3"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -218,43 +218,92 @@ install_or_upgrade_acme() {
   return 1
 }
 
+download_manager_file() {
+  local repo_path="$1" target="$2" timestamp="$3" api_url raw_url
+  api_url="https://api.github.com/repos/${MANAGER_REPO}/contents/${repo_path}"
+  raw_url="${MANAGER_RAW_BASE}/${repo_path}?ts=${timestamp}"
+
+  if [[ "$MANAGER_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] &&
+     curl --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -fsSL \
+       -H 'Accept: application/vnd.github.raw+json' \
+       --get --data-urlencode "ref=${MANAGER_REF}" --data-urlencode "ts=${timestamp}" \
+       "$api_url" -o "$target"; then
+    return 0
+  fi
+
+  warn "GitHub API 下载失败，改用 Raw 地址重试。"
+  curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$raw_url" -o "$target"
+}
+
+MANAGER_UPDATE_CHANGED=0
+
 update_manager() {
-  local timestamp installer installer_url source_url rc
+  local timestamp update_dir installer source current_version remote_version installer_version installed_version rc
   require_root
   command -v curl >/dev/null 2>&1 || install_dependencies || return 1
+  MANAGER_UPDATE_CHANGED=0
 
   timestamp="$(date +%s)"
-  installer_url="${MANAGER_RAW_BASE}/install.sh?ts=${timestamp}"
-  source_url="${MANAGER_RAW_BASE}/acme-manager.sh?ts=${timestamp}"
-  installer="$(mktemp /tmp/acme-manager-bootstrap.XXXXXX.sh)" || return 1
-
-  info "正在检查 ${MANAGER_REPO}@${MANAGER_REF} 的管理器版本..."
-  if ! curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$installer_url" -o "$installer"; then
-    rm -f "$installer"
-    error "无法下载 GitHub 引导安装器。"
-    return 1
-  fi
-  if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for acme-manager\.$' "$installer"; then
-    rm -f "$installer"
-    error "下载内容未通过安装器校验，拒绝更新。"
-    return 1
+  update_dir="$(mktemp -d /tmp/acme-manager-update.XXXXXX)" || return 1
+  installer="${update_dir}/install.sh"
+  source="${update_dir}/acme-manager.sh"
+  current_version="$VERSION"
+  if [[ -x "$INSTALL_PATH" ]]; then
+    installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+    [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && current_version="$installed_version"
   fi
 
-  ACME_MANAGER_REPO="$MANAGER_REPO" \
-    ACME_MANAGER_REF="$MANAGER_REF" \
-    ACME_MANAGER_SOURCE_URL="$source_url" \
-    ACME_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
-    ACME_MANAGER_QUICK_PATH="$QUICK_PATH" \
-    ACME_MANAGER_COMPAT_PATH="$COMPAT_PATH" \
-    bash "$installer" version
+  info "正在检查 ${MANAGER_REPO}@${MANAGER_REF}，当前版本 ${current_version}..."
+  if ! download_manager_file install.sh "$installer" "$timestamp" ||
+     ! download_manager_file acme-manager.sh "$source" "$timestamp"; then
+    rm -rf -- "$update_dir"
+    error "无法下载 acme-manager 更新文件。"
+    return 1
+  fi
+
+  remote_version="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$source")"
+  installer_version="$(awk -F '"' '/^INSTALLER_VERSION="[0-9]/{print $2; exit}' "$installer")"
+  if ! bash -n "$installer" || ! grep -q '^# Bootstrap installer for acme-manager\.$' "$installer" ||
+     ! bash -n "$source" || ! grep -q '^PROGRAM="acme-manager"$' "$source" ||
+     [[ ! "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+     [[ "$installer_version" != "$remote_version" ]]; then
+    rm -rf -- "$update_dir"
+    error "远端更新文件版本不一致或校验失败，拒绝安装。"
+    return 1
+  fi
+
+  info "远端版本：${remote_version}"
+  if [[ "$remote_version" == "$current_version" ]]; then
+    rm -rf -- "$update_dir"
+    ok "acme-manager 已经是最新版 ${current_version}。"
+    return 0
+  fi
+
+  (
+    unset ACME_MANAGER_SOURCE_URL
+    ACME_MANAGER_REPO="$MANAGER_REPO" \
+      ACME_MANAGER_REF="$MANAGER_REF" \
+      ACME_MANAGER_INSTALL_PATH="$INSTALL_PATH" \
+      ACME_MANAGER_QUICK_PATH="$QUICK_PATH" \
+      ACME_MANAGER_COMPAT_PATH="$COMPAT_PATH" \
+      bash "$installer" version
+  )
   rc=$?
-  rm -f "$installer"
-
   if (( rc != 0 )); then
+    rm -rf -- "$update_dir"
     error "acme-manager 更新失败。"
     return "$rc"
   fi
-  ok "acme-manager 更新完成。"
+
+  installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+  rm -rf -- "$update_dir"
+  if [[ "$installed_version" != "$remote_version" ]]; then
+    error "安装后版本核对失败：期望 ${remote_version}，实际 ${installed_version:-未知}。"
+    return 1
+  fi
+
+  MANAGER_UPDATE_CHANGED=1
+  ok "acme-manager 已从 ${current_version} 更新到 ${installed_version}。"
 }
 
 install_command_alias() {
@@ -278,7 +327,7 @@ install_manager_binary() {
     chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
     if [[ -x "$INSTALL_PATH" ]]; then
-      installed_version="$("$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+      installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
     fi
     if [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
        [[ "$(printf '%s\n' "$VERSION" "$installed_version" | sort -V | head -n 1)" == "$VERSION" ]] &&
@@ -1013,7 +1062,7 @@ trim_manager_log_if_large() {
 doctor() {
   local installed_version="未安装" installed_hash="未知" quick_target="不存在" compat_target="不存在"
   local acme_version="未安装" cert_count=0 log_size=0
-  [[ ! -x "$INSTALL_PATH" ]] || installed_version="$("$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
+  [[ ! -x "$INSTALL_PATH" ]] || installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
   [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
   [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
   [[ ! -e "$COMPAT_PATH" && ! -L "$COMPAT_PATH" ]] || compat_target="$(readlink -f "$COMPAT_PATH" 2>/dev/null || printf '无法解析')"
@@ -1094,16 +1143,18 @@ maintenance_menu() {
     fi
     case "$choice" in
       1)
-        if update_manager; then
-          info "正在重新载入最新版菜单..."
+        if update_manager && (( MANAGER_UPDATE_CHANGED )); then
+          info "按 Enter 键后重新载入新版菜单。"
+          pause
           exec "$INSTALL_PATH"
         fi
         pause
         ;;
       2) install_or_upgrade_acme; pause ;;
       3)
-        if install_or_upgrade_acme && update_manager; then
-          info "正在重新载入最新版菜单..."
+        if install_or_upgrade_acme && update_manager && (( MANAGER_UPDATE_CHANGED )); then
+          info "按 Enter 键后重新载入新版菜单。"
+          pause
           exec "$INSTALL_PATH"
         fi
         pause

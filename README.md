@@ -1,6 +1,6 @@
 # acme-manager
 
-Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署和续期 Let's Encrypt ECC 证书。当前版本：`2.3.2`。
+Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署和续期 Let's Encrypt ECC 证书。当前版本：`2.3.3`。
 
 ## 安装
 
@@ -90,7 +90,7 @@ sudo acme doctor                 # 运行诊断
 
 只有排障时才使用 `sudo acme renew example.com --force`，否则可能触发 Let's Encrypt 限频。
 
-更新脚本或 `acme.sh`：菜单选择 `1`。已有证书需要重新部署：菜单选择 `7 -> 1`，不必重新申请。
+更新管理器：菜单选择 `1 -> 1`。脚本会显示当前和远端版本；确有新版本时，按 Enter 后重新载入菜单。更新全部选择 `1 -> 3`。已有证书需要重新部署：菜单选择 `7 -> 1`，不必重新申请。
 
 日志位于 `/var/log/acme-manager/renew.log`，超过 5 MiB 后自动保留最近 2000 行。
 
