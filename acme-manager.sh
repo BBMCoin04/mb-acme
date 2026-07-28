@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="2.3.3"
+VERSION="1.1.1"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -18,6 +18,8 @@ CERT_ROOT="${CERT_ROOT:-/etc/acme/certs}"
 LOG_ROOT="${LOG_ROOT:-/var/log/acme-manager}"
 LOG_FILE="${LOG_ROOT}/renew.log"
 LOCK_FILE="${ACME_MANAGER_LOCK_FILE:-/run/lock/acme-manager.lock}"
+RUNTIME_ROOT="${ACME_MANAGER_RUNTIME_ROOT:-/run/acme-manager}"
+PORT80_STATE_FILE="${RUNTIME_ROOT}/port80-services.state"
 SYSTEMD_UNIT_DIR="${ACME_MANAGER_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 RENEW_SERVICE_FILE="${SYSTEMD_UNIT_DIR}/acme-manager-renew.service"
 RENEW_TIMER_FILE="${SYSTEMD_UNIT_DIR}/acme-manager-renew.timer"
@@ -72,7 +74,8 @@ require_root() {
 ensure_directories() {
   install -d -m 0700 "$LOG_ROOT" &&
     install -d -m 0750 "$CERT_ROOT" &&
-    install -d -m 0755 "$(dirname "$LOCK_FILE")"
+    install -d -m 0755 "$(dirname "$LOCK_FILE")" &&
+    install -d -m 0700 "$RUNTIME_ROOT"
 }
 
 atomic_install_file() {
@@ -132,7 +135,7 @@ trim() {
 
 install_dependencies() {
   local missing=() cmd manager
-  for cmd in curl openssl socat flock; do
+  for cmd in curl openssl socat flock ss; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   (( ${#missing[@]} == 0 )) && return 0
@@ -140,22 +143,22 @@ install_dependencies() {
   warn "缺少必要命令：${missing[*]}，准备安装依赖。"
   if command -v apt-get >/dev/null 2>&1; then
     manager="apt"
-    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl socat util-linux
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl openssl socat util-linux iproute2
   elif command -v dnf >/dev/null 2>&1; then
     manager="dnf"
-    dnf install -y ca-certificates curl openssl socat util-linux
+    dnf install -y ca-certificates curl openssl socat util-linux iproute
   elif command -v yum >/dev/null 2>&1; then
     manager="yum"
-    yum install -y ca-certificates curl openssl socat util-linux
+    yum install -y ca-certificates curl openssl socat util-linux iproute
   elif command -v apk >/dev/null 2>&1; then
     manager="apk"
-    apk add --no-cache bash ca-certificates curl openssl socat util-linux
+    apk add --no-cache bash ca-certificates curl openssl socat util-linux iproute2
   else
-    error "无法识别包管理器，请手动安装：ca-certificates curl openssl socat util-linux"
+    error "无法识别包管理器，请手动安装：ca-certificates curl openssl socat util-linux iproute2"
     return 1
   fi
 
-  for cmd in curl openssl socat flock; do
+  for cmd in curl openssl socat flock ss; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       error "使用 ${manager} 安装依赖后仍缺少命令：${cmd}"
       return 1
@@ -320,22 +323,12 @@ install_command_alias() {
 }
 
 install_manager_binary() {
-  local installed_version=""
   validate_manager_paths || return 1
   install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
     chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
-    if [[ -x "$INSTALL_PATH" ]]; then
-      installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
-    fi
-    if [[ "$installed_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
-       [[ "$(printf '%s\n' "$VERSION" "$installed_version" | sort -V | head -n 1)" == "$VERSION" ]] &&
-       [[ "$installed_version" != "$VERSION" ]]; then
-      warn "固定管理器 ${installed_version} 新于当前脚本 ${VERSION}，不会用旧脚本覆盖。"
-    else
-      atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
-    fi
+    atomic_install_file "$SELF_PATH" "$INSTALL_PATH" 0755 || return 1
   else
     error "当前脚本来自临时数据流，无法安装自动续期所需的固定副本。"
     error "请改用仓库中的 install.sh 引导安装器。"
@@ -549,7 +542,7 @@ port_80_in_use() {
   elif command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:80 -sTCP:LISTEN >/dev/null 2>&1
   else
-    return 1
+    return 2
   fi
 }
 
@@ -558,7 +551,221 @@ show_port_80_owner() {
     ss -ltnp 2>/dev/null | awk 'NR == 1 || $4 ~ /:80$|\]:80$/'
   elif command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null || true
+  else
+    warn "缺少 ss 或 lsof，无法识别 80 端口监听者。"
   fi
+}
+
+validate_systemd_service() {
+  local service="$1" short_name="${1%.service}"
+  [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]*$ ]] || return 1
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || return 1
+  systemctl cat "$service" >/dev/null 2>&1 || return 1
+  case "$short_name" in
+    docker|containerd|podman|kubelet)
+      error "拒绝自动停止容器运行时 ${service}；这会中断所有容器。"
+      error "请改用 webroot，或为占用 80 端口的单个容器配置独立 systemd 服务。"
+      return 1
+      ;;
+  esac
+}
+
+detect_port_80_systemd_services() {
+  local pid cgroup_path component service
+  local -a cgroup_parts=()
+  command -v ss >/dev/null 2>&1 || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/cgroup" ]] || continue
+    while IFS=: read -r _ _ cgroup_path; do
+      IFS='/' read -r -a cgroup_parts <<< "$cgroup_path"
+      for component in "${cgroup_parts[@]}"; do
+        [[ "$component" == *.service ]] || continue
+        service="$component"
+        validate_systemd_service "$service" >/dev/null 2>&1 || continue
+        printf '%s\n' "$service"
+      done
+    done < "/proc/${pid}/cgroup"
+  done < <(ss -ltnp 2>/dev/null | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u)
+}
+
+collect_port80_services() {
+  local input service detected_text=""
+  local -a detected=() candidates=()
+  PORT80_SERVICES=()
+
+  mapfile -t detected < <(detect_port_80_systemd_services | sort -u)
+  if (( ${#detected[@]} > 0 )); then
+    detected_text="${detected[*]}"
+    info "自动识别到 80 端口对应服务：${detected_text}"
+  fi
+
+  printf 'standalone 会把以下服务名写入续签钩子；验证时只停止其中当时正在运行的服务。\n'
+  if [[ -n "$detected_text" ]]; then
+    read -r -p "systemd 服务名，多个用空格或逗号分隔 [${detected_text}]：" input
+    input="${input:-$detected_text}"
+  else
+    read -r -p "systemd 服务名，多个用空格或逗号分隔（当前及续签时都无需停服务则留空）：" input
+  fi
+
+  input="${input//,/ }"
+  read -r -a candidates <<< "$input"
+  for service in "${candidates[@]}"; do
+    if ! validate_systemd_service "$service"; then
+      error "systemd 服务不存在、名称无效或不允许自动停止：${service}"
+      return 1
+    fi
+    PORT80_SERVICES+=("$service")
+  done
+}
+
+declare -a PORT80_SERVICES=()
+
+port80_restore() {
+  local expected_owner="${1:-}" expected_token="${ACME_MANAGER_RUN_TOKEN:-}"
+  local owner_header token_header owner token service rc=0
+  require_root
+  [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]] || return 0
+  [[ -f "$PORT80_STATE_FILE" && ! -L "$PORT80_STATE_FILE" ]] || {
+    error "80 端口恢复状态文件类型异常：${PORT80_STATE_FILE}"
+    return 1
+  }
+
+  IFS= read -r owner_header < "$PORT80_STATE_FILE" || owner_header=""
+  if [[ "$owner_header" != owner:* ]]; then
+    error "80 端口恢复状态缺少所有者信息，拒绝自动执行。"
+    return 1
+  fi
+  owner="${owner_header#owner:}"
+  if ! validate_domain "$owner" || [[ "$owner" == \*.* ]]; then
+    error "80 端口恢复状态中的所有者无效：${owner}"
+    return 1
+  fi
+  token_header="$(awk 'NR == 2 {print; exit}' "$PORT80_STATE_FILE")"
+  if [[ "$token_header" != token:* ]]; then
+    error "80 端口恢复状态缺少运行标识，拒绝自动执行。"
+    return 1
+  fi
+  token="${token_header#token:}"
+  if [[ -n "$expected_owner" && "$expected_owner" != "$owner" ]]; then
+    warn "80 端口当前由 ${owner} 的验证流程占用，${expected_owner} 不执行恢复。"
+    return 0
+  fi
+  if [[ -n "$expected_token" && "$expected_token" != "$token" ]]; then
+    warn "80 端口恢复状态属于另一个 ACME 进程，本进程不执行恢复。"
+    return 0
+  fi
+
+  while IFS= read -r service; do
+    [[ "$service" == service:* ]] || continue
+    service="${service#service:}"
+    if ! validate_systemd_service "$service"; then
+      error "状态文件中包含无效服务名，拒绝执行：${service}"
+      rc=1
+      continue
+    fi
+    if systemctl start "$service"; then
+      ok "已恢复服务：${service}"
+    else
+      error "无法恢复服务：${service}"
+      rc=1
+    fi
+  done < "$PORT80_STATE_FILE"
+
+  (( rc != 0 )) || rm -f -- "$PORT80_STATE_FILE"
+  return "$rc"
+}
+
+port80_prepare() {
+  local owner="${1:-}" token="${ACME_MANAGER_RUN_TOKEN:-unmanaged}" service port_rc
+  require_root
+  ensure_directories || return 1
+  if ! validate_domain "$owner" || [[ "$owner" == \*.* ]]; then
+    error "80 端口避让需要有效的证书主域名。"
+    return 1
+  fi
+  shift
+  if [[ ! "$token" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+    error "ACME 运行标识格式异常，拒绝执行 80 端口避让。"
+    return 1
+  fi
+  (( $# > 0 )) || {
+    error "没有配置需要临时停止的 systemd 服务。"
+    return 1
+  }
+
+  for service in "$@"; do
+    validate_systemd_service "$service" || return 1
+  done
+
+  if [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]]; then
+    error "已有另一个证书验证流程占用 80 端口恢复状态。"
+    error "若确认没有签发任务运行，请先执行：${QUICK_PATH} port80-restore"
+    return 1
+  fi
+  printf 'owner:%s\ntoken:%s\n' "$owner" "$token" > "$PORT80_STATE_FILE" || return 1
+  chmod 0600 "$PORT80_STATE_FILE" || return 1
+
+  for service in "$@"; do
+    if systemctl is-active --quiet "$service"; then
+      printf 'service:%s\n' "$service" >> "$PORT80_STATE_FILE" || { port80_restore "$owner"; return 1; }
+      info "临时停止服务：${service}"
+      if ! systemctl stop "$service"; then
+        error "停止 ${service} 失败。"
+        port80_restore "$owner" || true
+        return 1
+      fi
+    fi
+  done
+
+  port_80_in_use
+  port_rc=$?
+  if (( port_rc == 0 )); then
+    error "停止已配置服务后 TCP 80 端口仍被占用。"
+    show_port_80_owner
+    port80_restore "$owner" || true
+    return 1
+  elif (( port_rc == 2 )); then
+    error "无法确认 TCP 80 端口是否空闲，需要安装 ss（iproute2）或 lsof。"
+    port80_restore "$owner" || true
+    return 1
+  fi
+  ok "TCP 80 端口已临时让出。"
+}
+
+handle_acme_signal() {
+  local exit_code="$1"
+  trap - HUP INT TERM
+  port80_restore || true
+  exit "$exit_code"
+}
+
+run_logged_acme_command() {
+  local mode="$1" rc restore_rc=0
+  shift
+
+  if [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]]; then
+    error "已有证书验证流程占用 80 端口恢复状态，本次 ACME 命令退出。"
+    error "若确认没有签发任务运行，请执行：${QUICK_PATH} port80-restore"
+    return 1
+  fi
+
+  ACME_MANAGER_RUN_TOKEN="manager-$$-$(date +%s)-${RANDOM}"
+  export ACME_MANAGER_RUN_TOKEN
+  trap 'handle_acme_signal 129' HUP
+  trap 'handle_acme_signal 130' INT
+  trap 'handle_acme_signal 143' TERM
+  log_command "$mode" "$@"
+  rc=$?
+  if [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]]; then
+    warn "ACME 命令结束后仍有本进程的服务待恢复，正在执行兜底恢复。"
+    port80_restore || restore_rc=$?
+  fi
+  trap - HUP INT TERM
+  unset ACME_MANAGER_RUN_TOKEN
+  (( restore_rc == 0 )) || return "$restore_rc"
+  return "$rc"
 }
 
 MAIN_DOMAIN=""
@@ -635,33 +842,47 @@ run_issue_command() {
   command+=("${DOMAIN_ARGS[@]}")
   command+=("$@")
   info "开始使用 ${method} 验证申请证书。"
-  log_command interactive "${command[@]}"
+  run_logged_acme_command interactive "${command[@]}"
 }
 
 issue_standalone() {
-  local service pre_hook post_hook
+  local service pre_hook post_hook port_rc
   if (( HAS_WILDCARD )); then
     error "HTTP-01 不支持泛域名证书，请选择 DNS API 模式。"
     return 1
   fi
 
-  if port_80_in_use; then
-    warn "TCP 80 端口已被占用，不会强制结束任何进程。"
+  port_80_in_use
+  port_rc=$?
+  if (( port_rc == 0 )); then
+    warn "TCP 80 端口当前已被占用；下面配置的服务只会在验证期间临时停止。"
     show_port_80_owner
-    printf '可返回后改用 webroot/DNS API，或让 systemd 在验证前后停启一个服务。\n'
-    read -r -p "需要自动停启的 systemd 服务名（例如 nginx；留空取消）：" service
-    [[ -n "$service" ]] || return 1
-    if [[ ! "$service" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]*$ ]] || ! systemctl cat "$service" >/dev/null 2>&1; then
-      error "systemd 服务不存在或名称无效：${service}"
-      return 1
-    fi
-    pre_hook="systemctl stop ${service}"
-    post_hook="systemctl start ${service}"
-    run_issue_command "standalone" --standalone --pre-hook "$pre_hook" --post-hook "$post_hook"
+  elif (( port_rc == 2 )); then
+    error "无法确认 TCP 80 端口状态，需要安装 ss（iproute2）或 lsof。"
+    return 1
+  else
+    info "TCP 80 端口当前空闲；仍可配置续签时可能需要避让的服务。"
+  fi
+
+  collect_port80_services || return 1
+  if (( port_rc == 0 && ${#PORT80_SERVICES[@]} == 0 )); then
+    error "80 端口已被占用，必须配置对应的 systemd 服务，或改用 webroot。"
+    return 1
+  fi
+
+  if (( ${#PORT80_SERVICES[@]} == 0 )); then
+    run_issue_command "standalone" --standalone
     return $?
   fi
 
-  run_issue_command "standalone" --standalone
+  pre_hook="${INSTALL_PATH} port80-prepare ${MAIN_DOMAIN}"
+  for service in "${PORT80_SERVICES[@]}"; do
+    pre_hook+=" ${service}"
+  done
+  post_hook="${INSTALL_PATH} port80-restore ${MAIN_DOMAIN}"
+  info "申请和今后续签时将临时停启：${PORT80_SERVICES[*]}"
+  run_issue_command "standalone（自动避让 80 端口）" \
+    --standalone --pre-hook "$pre_hook" --post-hook "$post_hook"
 }
 
 issue_webroot() {
@@ -879,7 +1100,7 @@ issue_certificate() {
 
   build_domain_args
   printf '\n验证方式：\n'
-  printf '  1. standalone（80 端口空闲时使用）\n'
+  printf '  1. standalone（申请/续签时自动临时让出 80 端口）\n'
   printf '  2. webroot（已有 Web 服务，推荐）\n'
   printf '  3. Cloudflare DNS API（支持泛域名）\n'
   printf '  4. DNSPod DNS API（支持泛域名）\n'
@@ -930,6 +1151,83 @@ deploy_existing() {
   print_integration_hint "$domain"
 }
 
+delete_certificate() {
+  local domain="${1:-}" confirmation acme_dir deployed_dir domain_conf removed_conf
+  local had_acme=0 had_deployed=0
+  require_root
+  require_acme || return 1
+
+  if [[ -z "$domain" ]]; then
+    printf '\n当前 acme.sh 证书记录：\n'
+    "$ACME_BIN" --list || true
+    read -r -p "要彻底删除的证书主域名：" domain
+  fi
+  domain="${domain,,}"
+  if [[ "$domain" == \*.* ]] || ! validate_domain "$domain"; then
+    error "请提供证书记录中的主域名，不能填写泛域名 SAN。"
+    return 1
+  fi
+
+  acme_dir="${ACME_HOME}/${domain}_ecc"
+  deployed_dir="${CERT_ROOT}/${domain}"
+  domain_conf="${acme_dir}/${domain}.conf"
+  removed_conf="${domain_conf}.removed"
+  if [[ -L "$acme_dir" || -L "$deployed_dir" ]]; then
+    error "证书目录不能是软链接，拒绝执行递归删除。"
+    return 1
+  fi
+  [[ ! -e "$acme_dir" ]] || had_acme=1
+  [[ ! -e "$deployed_dir" && ! -L "$deployed_dir" ]] || had_deployed=1
+  if (( had_acme == 0 && had_deployed == 0 )); then
+    error "没有找到 ${domain} 的 ECC 证书记录或部署目录。"
+    return 1
+  fi
+
+  warn "此操作不可撤销，将删除："
+  (( had_acme == 0 )) || printf '  acme.sh 续签记录、私钥和证书：%s\n' "$acme_dir"
+  (( had_deployed == 0 )) || printf '  已部署证书和私钥：%s\n' "$deployed_dir"
+  warn "依赖这些路径的 Nginx、Sing-box 等服务可能在下次 reload/restart 时失败。"
+  read -r -p "请输入主域名 ${domain} 以确认彻底删除：" confirmation
+  if [[ "${confirmation,,}" != "$domain" ]]; then
+    info "确认内容不匹配，已取消删除。"
+    return 1
+  fi
+
+  acquire_lock || return 1
+  if [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]]; then
+    warn "发现待恢复的 80 端口服务，先执行恢复。"
+    port80_restore || return 1
+  fi
+
+  if [[ -f "$domain_conf" ]]; then
+    info "正在从 acme.sh 续签列表移除 ${domain}..."
+    if ! log_command interactive "$ACME_BIN" --remove -d "$domain" --ecc; then
+      error "acme.sh 未能移除续签记录；为避免半删除，未清理任何目录。"
+      return 1
+    fi
+  elif [[ -f "$removed_conf" ]]; then
+    info "acme.sh 续签记录此前已移除，继续清理残留文件。"
+  elif (( had_acme )); then
+    warn "未找到有效续签配置，继续清理孤立的 acme.sh 证书目录。"
+  fi
+
+  if (( had_acme )) && ! rm -rf -- "$acme_dir"; then
+    error "无法删除 acme.sh 证书目录：${acme_dir}"
+    return 1
+  fi
+  if (( had_deployed )) && ! rm -rf -- "$deployed_dir"; then
+    error "acme.sh 记录已删除，但部署目录清理失败：${deployed_dir}"
+    return 1
+  fi
+  if [[ -e "$acme_dir" || -L "$acme_dir" || -e "$deployed_dir" || -L "$deployed_dir" ]]; then
+    error "删除后检查失败，仍有证书路径残留。"
+    return 1
+  fi
+
+  ok "${domain} 的续签记录、内部证书、私钥和部署副本已彻底删除。"
+  info "共享 ACME 账户、其他证书、全局续签任务和审计日志未受影响。"
+}
+
 renew_all() {
   local mode="interactive" force=0 arg rc
   require_root
@@ -952,7 +1250,7 @@ renew_all() {
     info "仅检查并续期已进入续期窗口的证书，不会强制重签。"
   fi
 
-  log_command "$mode" "${command[@]}"
+  run_logged_acme_command "$mode" "${command[@]}"
   rc=$?
   if (( rc == 0 )); then
     [[ "$mode" == "interactive" ]] && ok "续期检查完成。"
@@ -981,7 +1279,7 @@ renew_domain() {
   acquire_lock || return 1
   local -a command=("$ACME_BIN" --renew -d "$domain" --ecc)
   [[ "$force" == "--force" ]] && command+=(--force)
-  log_command interactive "${command[@]}"
+  run_logged_acme_command interactive "${command[@]}"
 }
 
 manual_renew_menu() {
@@ -1082,6 +1380,11 @@ doctor() {
   printf 'acme.sh：%s\n' "$acme_version"
   printf '证书目录：%s（已部署 %s 张）\n' "$CERT_ROOT" "$cert_count"
   printf '续期日志：%s（%s 字节）\n' "$LOG_FILE" "$log_size"
+  if [[ -e "$PORT80_STATE_FILE" || -L "$PORT80_STATE_FILE" ]]; then
+    printf '80 端口恢复状态：存在待恢复服务（%s）\n' "$PORT80_STATE_FILE"
+  else
+    printf '80 端口恢复状态：正常\n'
+  fi
   scheduler_status
   printf '命令解析：\n'
   type -a acme 2>/dev/null || true
@@ -1100,10 +1403,12 @@ ${PROGRAM} ${VERSION}
   acme renew-all --force  强制续期所有证书（谨慎使用）
   acme renew DOMAIN       检查指定 ECC 证书
   acme renew DOMAIN --force
+  acme delete DOMAIN      彻底删除指定 ECC 证书（需要交互确认）
   acme scheduler          安装/修复自动续期任务
   acme paths DOMAIN       输出可供 source 的证书路径变量
   acme path DOMAIN TYPE   仅输出一个路径；TYPE: cert/ca/fullchain/key/env
   acme doctor             检查版本、命令入口和续期状态
+  acme port80-restore     手动恢复因异常中断而停止的服务
   acme install            安装或升级 acme.sh
   acme version
 
@@ -1204,9 +1509,10 @@ main_menu() {
     printf '  2. 申请并部署新证书\n'
     printf '  3. 查看证书与续期状态\n'
     printf '  4. 手动续期\n'
-    printf '  5. 输出指定域名的证书路径\n'
-    printf '  6. 查看最近日志\n'
-    printf '  7. 高级维护\n'
+    printf '  5. 彻底删除证书\n'
+    printf '  6. 输出指定域名的证书路径\n'
+    printf '  7. 查看最近日志\n'
+    printf '  8. 高级维护\n'
     printf '  0. 退出\n'
     if ! read -r -p "请选择：" choice; then
       printf '\n'
@@ -1218,13 +1524,14 @@ main_menu() {
       2) issue_certificate; pause ;;
       3) show_status; pause ;;
       4) manual_renew_menu; pause ;;
-      5)
+      5) delete_certificate; pause ;;
+      6)
         read -r -p "主域名：" domain
         show_paths "$domain"
         pause
         ;;
-      6) show_log; pause ;;
-      7) advanced_menu ;;
+      7) show_log; pause ;;
+      8) advanced_menu ;;
       0) return 0 ;;
       *) error "无效选项。"; pause ;;
     esac
@@ -1240,10 +1547,13 @@ main() {
     status) require_root; show_status ;;
     renew-all) shift; renew_all "$@" ;;
     renew) shift; renew_domain "${1:-}" "${2:-}" ;;
+    delete) shift; delete_certificate "${1:-}" ;;
     scheduler) setup_scheduler ;;
     doctor) require_root; doctor ;;
     paths) require_root; show_paths "${2:-}" ;;
     path) require_root; show_single_path "${2:-}" "${3:-}" ;;
+    port80-prepare) shift; port80_prepare "$@" ;;
+    port80-restore) port80_restore ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${subcommand}"; show_help; return 2 ;;
