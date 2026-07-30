@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -490,7 +490,7 @@ scheduler_status() {
       printf '自动续期：cron 配置存在，但 cron/crond 缺失\n'
     fi
   elif native_acme_cron_present; then
-    printf '自动续期：acme.sh 原生 cron 已配置'
+    printf '自动续期：acme.sh 原生 cron 已配置（不写入管理器日志）'
     print_cron_runtime_suffix
   else
     printf '自动续期：未配置\n'
@@ -500,7 +500,7 @@ scheduler_status() {
 acquire_lock() {
   if ! ensure_directories || ! exec 9>"$LOCK_FILE"; then
     error "无法创建任务锁：${LOCK_FILE}"
-    return 1
+    return 2
   fi
   if ! flock -n 9; then
     warn "另一个申请或续期任务正在运行，本次操作退出。"
@@ -580,14 +580,22 @@ detect_port_80_systemd_services() {
     [[ "$pid" =~ ^[0-9]+$ && -r "/proc/${pid}/cgroup" ]] || continue
     while IFS=: read -r _ _ cgroup_path; do
       IFS='/' read -r -a cgroup_parts <<< "$cgroup_path"
-      for component in "${cgroup_parts[@]}"; do
-        [[ "$component" == *.service ]] || continue
-        service="$component"
-        validate_systemd_service "$service" >/dev/null 2>&1 || continue
-        printf '%s\n' "$service"
-      done
+      if (( ${#cgroup_parts[@]} > 0 )); then
+        for component in "${cgroup_parts[@]}"; do
+          [[ "$component" == *.service ]] || continue
+          service="$component"
+          validate_systemd_service "$service" >/dev/null 2>&1 || continue
+          printf '%s\n' "$service"
+        done
+      fi
     done < "/proc/${pid}/cgroup"
-  done < <(ss -ltnp 2>/dev/null | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u)
+  done < <(
+    ss -H -ltnp 2>/dev/null |
+      awk '$4 ~ /:80$/ { print }' |
+      grep -o 'pid=[0-9]\+' |
+      cut -d= -f2 |
+      sort -u
+  )
 }
 
 collect_port80_services() {
@@ -611,13 +619,15 @@ collect_port80_services() {
 
   input="${input//,/ }"
   read -r -a candidates <<< "$input"
-  for service in "${candidates[@]}"; do
-    if ! validate_systemd_service "$service"; then
-      error "systemd 服务不存在、名称无效或不允许自动停止：${service}"
-      return 1
-    fi
-    PORT80_SERVICES+=("$service")
-  done
+  if (( ${#candidates[@]} > 0 )); then
+    for service in "${candidates[@]}"; do
+      if ! validate_systemd_service "$service"; then
+        error "systemd 服务不存在、名称无效或不允许自动停止：${service}"
+        return 1
+      fi
+      PORT80_SERVICES+=("$service")
+    done
+  fi
 }
 
 declare -a PORT80_SERVICES=()
@@ -775,9 +785,11 @@ declare -a ISSUE_DOMAINS=()
 add_issue_domain() {
   local candidate="${1,,}" existing
   validate_domain "$candidate" || return 1
-  for existing in "${ISSUE_DOMAINS[@]}"; do
-    [[ "$existing" == "$candidate" ]] && return 0
-  done
+  if (( ${#ISSUE_DOMAINS[@]} > 0 )); then
+    for existing in "${ISSUE_DOMAINS[@]}"; do
+      [[ "$existing" == "$candidate" ]] && return 0
+    done
+  fi
   ISSUE_DOMAINS+=("$candidate")
   [[ "$candidate" == \*.* ]] && HAS_WILDCARD=1
 }
@@ -799,6 +811,12 @@ collect_domains() {
     fi
     error "域名格式不正确；中文域名请先转换为 Punycode。"
   done
+
+  if certificate_exists "$MAIN_DOMAIN"; then
+    warn "${MAIN_DOMAIN} 已有 ECC 证书记录，不会重复签发。"
+    info "请使用 '重新部署已有证书'，或在手动续期菜单中操作。"
+    return 1
+  fi
 
   read -r -p "附加域名/SAN（多个用逗号分隔，留空跳过）：" input
   if [[ -n "$input" ]]; then
@@ -952,20 +970,44 @@ issue_dns_aliyun() {
   return "$rc"
 }
 
+get_saved_reload_command() {
+  local domain="$1"
+  "$ACME_BIN" --info -d "$domain" --ecc 2>/dev/null |
+    awk 'index($0, "Le_ReloadCmd=") == 1 { sub(/^Le_ReloadCmd=/, ""); print; exit }'
+}
+
 choose_reload_command() {
-  local service command
-  printf '\n证书续期成功后可以自动 reload 服务。留空表示暂不配置。\n'
-  read -r -p "systemd 服务名（例如 nginx、caddy、haproxy；留空跳过）：" service
-  if [[ -z "$service" ]]; then
-    RELOAD_COMMAND=""
-    return 0
+  local existing_command="${1:-}" service command
+  printf '\n证书续期成功后可以自动 reload 服务。\n'
+  if [[ -n "$existing_command" ]]; then
+    printf '当前 reload 命令：%s\n' "$existing_command"
+    printf '直接回车保留当前命令；输入 - 可清除。\n'
+  else
+    printf '留空表示暂不配置。\n'
   fi
-  if [[ ! "$service" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]*$ ]] || ! systemctl cat "$service" >/dev/null 2>&1; then
+
+  while true; do
+    if ! read -r -p "systemd 服务名（例如 nginx、caddy、haproxy）：" service; then
+      error "未读取到服务名，已取消部署。"
+      return 1
+    fi
+    if [[ -z "$service" ]]; then
+      RELOAD_COMMAND="$existing_command"
+      return 0
+    fi
+    if [[ "$service" == "-" && -n "$existing_command" ]]; then
+      RELOAD_COMMAND=""
+      return 0
+    fi
+    if [[ "$service" =~ ^[A-Za-z0-9][A-Za-z0-9@_.:-]*$ ]] &&
+       systemctl cat "$service" >/dev/null 2>&1; then
+      command="systemctl reload ${service}"
+      RELOAD_COMMAND="$command"
+      return 0
+    fi
     error "systemd 服务不存在或名称无效：${service}"
-    return 1
-  fi
-  command="systemctl reload ${service}"
-  RELOAD_COMMAND="$command"
+    warn "请重新输入，或直接回车跳过。"
+  done
 }
 
 RELOAD_COMMAND=""
@@ -1032,13 +1074,13 @@ print_integration_hint() {
 }
 
 deploy_certificate() {
-  local domain="$1" cert_dir rc output_file reload_failed=0
+  local domain="$1" existing_reload_command="${2:-}" cert_dir rc output_file reload_failed=0
   cert_dir="${CERT_ROOT}/${domain}"
   if ! install -d -m 0750 "$cert_dir"; then
     error "无法创建证书部署目录：${cert_dir}"
     return 1
   fi
-  choose_reload_command || return 1
+  choose_reload_command "$existing_reload_command" || return 1
 
   local -a command=(
     "$ACME_BIN" --install-cert -d "$domain" --ecc
@@ -1091,13 +1133,6 @@ issue_certificate() {
   require_acme || return 1
   install_dependencies || return 1
   collect_domains || return 1
-
-  if certificate_exists "$MAIN_DOMAIN"; then
-    warn "${MAIN_DOMAIN} 已有 ECC 证书记录，不会重复签发。"
-    info "请使用 '重新部署已有证书'，或在手动续期菜单中操作。"
-    return 1
-  fi
-
   build_domain_args
   printf '\n验证方式：\n'
   printf '  1. standalone（申请/续签时自动临时让出 80 端口）\n'
@@ -1131,7 +1166,7 @@ issue_certificate() {
 }
 
 deploy_existing() {
-  local domain
+  local domain existing_reload_command=""
   require_root
   require_acme || return 1
   read -r -p "输入 acme.sh 记录中的主域名：" domain
@@ -1145,8 +1180,12 @@ deploy_existing() {
     "$ACME_BIN" --list || true
     return 1
   fi
+  if ! existing_reload_command="$(get_saved_reload_command "$domain")"; then
+    error "无法读取 ${domain} 当前的 reload 配置，拒绝覆盖。"
+    return 1
+  fi
   acquire_lock || return 1
-  deploy_certificate "$domain" || return 1
+  deploy_certificate "$domain" "$existing_reload_command" || return 1
   setup_scheduler || return 1
   print_integration_hint "$domain"
 }
@@ -1240,7 +1279,15 @@ renew_all() {
     esac
   done
 
-  acquire_lock || return 0
+  local lock_rc
+  acquire_lock
+  lock_rc=$?
+  case "$lock_rc" in
+    0) ;;
+    1) return 0 ;;
+    *) return "$lock_rc" ;;
+  esac
+
   local -a command=("$ACME_BIN" --cron --home "$ACME_HOME")
   (( force )) && command+=(--force)
 
@@ -1312,8 +1359,9 @@ manual_renew_menu() {
 }
 
 show_status() {
-  local cert domain
+  local cert domain end_date end_epoch now_epoch remaining_seconds remaining_days
   require_acme || return 1
+  now_epoch="$(date +%s)"
   printf '\n%sacme.sh 证书记录%s\n' "$C_BOLD" "$C_RESET"
   "$ACME_BIN" --list || true
   printf '\n%s调度状态%s\n' "$C_BOLD" "$C_RESET"
@@ -1328,7 +1376,25 @@ show_status() {
     printf '%s\n' "${domain}:"
     printf '  fullchain=%s/fullchain.pem\n' "$(dirname "$cert")"
     printf '  key=%s/key.pem\n' "$(dirname "$cert")"
-    openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /' || warn "无法读取 ${cert}"
+    if openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'; then
+      end_date="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+      end_epoch="$(date -d "$end_date" +%s 2>/dev/null || true)"
+      if [[ "$end_epoch" =~ ^[0-9]+$ ]]; then
+        remaining_seconds=$(( end_epoch - now_epoch ))
+        if (( remaining_seconds < 0 )); then
+          printf '%s  状态：已过期%s\n' "$C_RED" "$C_RESET"
+        else
+          remaining_days=$(( remaining_seconds / 86400 ))
+          if (( remaining_days < 15 )); then
+            printf '%s  剩余天数：%d（即将到期）%s\n' "$C_RED" "$remaining_days" "$C_RESET"
+          else
+            printf '  剩余天数：%d\n' "$remaining_days"
+          fi
+        fi
+      fi
+    else
+      warn "无法读取 ${cert}"
+    fi
   done
   shopt -u nullglob
   (( found )) || printf '尚未在 %s 部署证书。\n' "$CERT_ROOT"
@@ -1553,7 +1619,7 @@ main() {
     paths) require_root; show_paths "${2:-}" ;;
     path) require_root; show_single_path "${2:-}" "${3:-}" ;;
     port80-prepare) shift; port80_prepare "$@" ;;
-    port80-restore) port80_restore ;;
+    port80-restore) shift; port80_restore "${1:-}" ;;
     version|--version|-v) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     help|--help|-h) show_help ;;
     *) error "未知命令：${subcommand}"; show_help; return 2 ;;
