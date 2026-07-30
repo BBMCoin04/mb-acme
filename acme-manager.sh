@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -971,9 +971,17 @@ issue_dns_aliyun() {
 }
 
 get_saved_reload_command() {
-  local domain="$1"
-  "$ACME_BIN" --info -d "$domain" --ecc 2>/dev/null |
-    awk 'index($0, "Le_ReloadCmd=") == 1 { sub(/^Le_ReloadCmd=/, ""); print; exit }'
+  local domain="$1" info line
+  if ! info="$("$ACME_BIN" --info -d "$domain" --ecc 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    if [[ "$line" == Le_ReloadCmd=* ]]; then
+      printf '%s' "${line#Le_ReloadCmd=}"
+      return 0
+    fi
+  done <<< "$info"
+  return 0
 }
 
 choose_reload_command() {

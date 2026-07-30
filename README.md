@@ -1,6 +1,6 @@
 # acme-manager
 
-Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.2`。
+Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.3`。
 
 ## 安装
 
