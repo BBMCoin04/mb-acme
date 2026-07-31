@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.4"
+VERSION="1.1.5"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -1178,14 +1178,26 @@ print_integration_hint() {
   printf '  "key_path": "%s/key.pem"\n' "$cert_dir"
 }
 
+cleanup_failed_deploy_dir() {
+  local cert_dir="$1" had_cert_dir="$2"
+  (( had_cert_dir == 0 )) || return 0
+  if [[ ! -s "$cert_dir/cert.pem" && ! -s "$cert_dir/ca.pem" &&
+        ! -s "$cert_dir/fullchain.pem" && ! -s "$cert_dir/key.pem" ]]; then
+    rm -f -- "$cert_dir/cert.pem" "$cert_dir/ca.pem" "$cert_dir/fullchain.pem" \
+      "$cert_dir/key.pem" "$cert_dir/paths.env" "$cert_dir/cert.crt" "$cert_dir/private.key"
+    rmdir -- "$cert_dir" 2>/dev/null || true
+  fi
+}
+
 deploy_certificate() {
-  local domain="$1" existing_reload_command="${2:-}" cert_dir rc output_file reload_failed=0
+  local domain="$1" existing_reload_command="${2:-}" cert_dir rc output_file reload_failed=0 had_cert_dir=0
   cert_dir="${CERT_ROOT}/${domain}"
+  [[ ! -d "$cert_dir" ]] || had_cert_dir=1
+  choose_reload_command "$existing_reload_command" || return 1
   if ! install -d -m 0750 "$cert_dir"; then
     error "无法创建证书部署目录：${cert_dir}"
     return 1
   fi
-  choose_reload_command "$existing_reload_command" || return 1
 
   local -a command=(
     "$ACME_BIN" --install-cert -d "$domain" --ecc
@@ -1196,8 +1208,14 @@ deploy_certificate() {
   )
   [[ -n "$RELOAD_COMMAND" ]] && command+=(--reloadcmd "$RELOAD_COMMAND")
 
-  ensure_directories || return 1
-  output_file="$(mktemp "${LOG_ROOT}/.deploy-output.XXXXXX")" || return 1
+  if ! ensure_directories; then
+    cleanup_failed_deploy_dir "$cert_dir" "$had_cert_dir"
+    return 1
+  fi
+  output_file="$(mktemp "${LOG_ROOT}/.deploy-output.XXXXXX")" || {
+    cleanup_failed_deploy_dir "$cert_dir" "$had_cert_dir"
+    return 1
+  }
   LOG_CAPTURE_FILE="$output_file" log_command interactive "${command[@]}"
   rc=$?
   if (( rc != 0 )); then
@@ -1209,6 +1227,7 @@ deploy_certificate() {
       warn "证书文件已写入，但服务 reload 失败；将继续完成部署和续期配置。"
     else
       rm -f -- "$output_file"
+      cleanup_failed_deploy_dir "$cert_dir" "$had_cert_dir"
       error "证书部署失败，请检查日志：${LOG_FILE}"
       return "$rc"
     fi
@@ -1296,7 +1315,7 @@ deploy_existing() {
 }
 
 delete_certificate() {
-  local domain="${1:-}" confirmation acme_dir deployed_dir domain_conf removed_conf
+  local domain="${1:-}" confirmation acme_dir deployed_dir domain_conf removed_conf deployed_list=""
   local had_acme=0 had_deployed=0
   require_root
   require_acme || return 1
@@ -1304,6 +1323,10 @@ delete_certificate() {
   if [[ -z "$domain" ]]; then
     printf '\n当前 acme.sh 证书记录：\n'
     "$ACME_BIN" --list || true
+    if [[ -d "$CERT_ROOT" ]]; then
+      deployed_list="$(find "$CERT_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '  %f\n' 2>/dev/null | sort)"
+    fi
+    printf '\n当前部署目录：\n%s\n' "${deployed_list:-  无}"
     read -r -p "要彻底删除的证书主域名：" domain
   fi
   domain="${domain,,}"
@@ -1464,7 +1487,7 @@ manual_renew_menu() {
 }
 
 show_status() {
-  local cert domain end_date end_epoch now_epoch remaining_seconds remaining_days
+  local cert cert_dir cert_info domain end_date end_epoch now_epoch remaining_seconds remaining_days
   require_acme || return 1
   now_epoch="$(date +%s)"
   printf '\n%sacme.sh 证书记录%s\n' "$C_BOLD" "$C_RESET"
@@ -1476,13 +1499,22 @@ show_status() {
   shopt -s nullglob
   local found=0
   for cert in "$CERT_ROOT"/*/fullchain.pem; do
+    cert_dir="$(dirname "$cert")"
+    domain="$(basename "$cert_dir")"
+    if [[ ! -s "$cert" || ! -s "$cert_dir/key.pem" ]]; then
+      warn "${domain} 的部署目录不完整：缺少有效 fullchain.pem 或 key.pem"
+      continue
+    fi
+    if ! cert_info="$(openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null)"; then
+      warn "${domain} 的 fullchain.pem 不是有效证书"
+      continue
+    fi
     found=1
-    domain="$(basename "$(dirname "$cert")")"
     printf '%s\n' "${domain}:"
-    printf '  fullchain=%s/fullchain.pem\n' "$(dirname "$cert")"
-    printf '  key=%s/key.pem\n' "$(dirname "$cert")"
-    if openssl x509 -in "$cert" -noout -subject -issuer -dates 2>/dev/null | sed 's/^/  /'; then
-      end_date="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+    printf '  fullchain=%s/fullchain.pem\n' "$cert_dir"
+    printf '  key=%s/key.pem\n' "$cert_dir"
+    printf '%s\n' "$cert_info" | sed 's/^/  /'
+    end_date="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2-)"
       end_epoch="$(date -d "$end_date" +%s 2>/dev/null || true)"
       if [[ "$end_epoch" =~ ^[0-9]+$ ]]; then
         remaining_seconds=$(( end_epoch - now_epoch ))
@@ -1497,9 +1529,6 @@ show_status() {
           fi
         fi
       fi
-    else
-      warn "无法读取 ${cert}"
-    fi
   done
   shopt -u nullglob
   (( found )) || printf '尚未在 %s 部署证书。\n' "$CERT_ROOT"
@@ -1530,7 +1559,7 @@ trim_manager_log_if_large() {
 
 doctor() {
   local installed_version="未安装" installed_hash="未知" quick_target="不存在" compat_target="不存在"
-  local acme_version="未安装" cert_count=0 log_size=0
+  local acme_version="未安装" cert_count=0 log_size=0 cert cert_dir
   [[ ! -x "$INSTALL_PATH" ]] || installed_version="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null || printf '无法执行')"
   [[ ! -f "$INSTALL_PATH" ]] || installed_hash="$(sha256sum "$INSTALL_PATH" 2>/dev/null | awk '{print $1}' || printf '未知')"
   [[ ! -e "$QUICK_PATH" && ! -L "$QUICK_PATH" ]] || quick_target="$(readlink -f "$QUICK_PATH" 2>/dev/null || printf '无法解析')"
@@ -1539,7 +1568,15 @@ doctor() {
     acme_version="$($ACME_BIN --version 2>/dev/null | tail -n 1 || printf '无法读取')"
   fi
   if [[ -d "$CERT_ROOT" ]]; then
-    cert_count="$(find "$CERT_ROOT" -mindepth 2 -maxdepth 2 -type f -name fullchain.pem 2>/dev/null | wc -l)"
+    shopt -s nullglob
+    for cert in "$CERT_ROOT"/*/fullchain.pem; do
+      cert_dir="$(dirname "$cert")"
+      if [[ -s "$cert" && -s "$cert_dir/key.pem" ]] &&
+         openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+        cert_count=$((cert_count + 1))
+      fi
+    done
+    shopt -u nullglob
   fi
   [[ ! -f "$LOG_FILE" ]] || log_size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || printf '0')"
 

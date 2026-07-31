@@ -1,6 +1,6 @@
 # acme-manager
 
-Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.4`。
+Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.5`。
 
 ## 安装
 
@@ -83,7 +83,7 @@ sudo acme port80-restore
 sudo acme delete example.com
 ```
 
-删除前必须再次输入完整主域名确认。脚本按以下顺序执行：
+删除菜单会同时显示 acme.sh 续签记录和 `/etc/acme/certs/` 部署目录，便于发现失败部署留下的孤立目录。删除前必须再次输入完整主域名确认。脚本按以下顺序执行：
 
 1. 调用 `acme.sh --remove -d example.com --ecc`，从自动续签列表移除证书。
 2. 删除 `/root/.acme.sh/example.com_ecc/` 中 acme.sh 默认保留的配置、证书、私钥和签发残留。
@@ -96,7 +96,7 @@ sudo acme delete example.com
 
 ## 证书路径
 
-每个主域名单独保存在 `/etc/acme/certs/<主域名>/`：
+每个主域名单独保存在 `/etc/acme/certs/<主域名>/`。失败部署产生且不含有效证书或私钥的新空目录会自动清理；状态和诊断只统计可解析且私钥存在的有效部署：
 
 ```text
 cert.pem       单张证书
