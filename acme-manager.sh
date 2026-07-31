@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 PROGRAM="acme-manager"
 INSTALL_PATH="${ACME_MANAGER_INSTALL_PATH:-/usr/local/sbin/acme-manager}"
 QUICK_PATH="${ACME_MANAGER_QUICK_PATH:-/usr/local/bin/acme}"
@@ -18,6 +18,7 @@ CERT_ROOT="${CERT_ROOT:-/etc/acme/certs}"
 LOG_ROOT="${LOG_ROOT:-/var/log/acme-manager}"
 LOG_FILE="${LOG_ROOT}/renew.log"
 LOCK_FILE="${ACME_MANAGER_LOCK_FILE:-/run/lock/acme-manager.lock}"
+LOCK_HELD=0
 RUNTIME_ROOT="${ACME_MANAGER_RUNTIME_ROOT:-/run/acme-manager}"
 PORT80_STATE_FILE="${RUNTIME_ROOT}/port80-services.state"
 SYSTEMD_UNIT_DIR="${ACME_MANAGER_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
@@ -84,6 +85,15 @@ atomic_install_file() {
   if ! install -m "$mode" "$source" "$temporary" || ! mv -f -- "$temporary" "$target"; then
     rm -f -- "$temporary"
     return 1
+  fi
+}
+
+restore_file_snapshot() {
+  local snapshot="$1" had_file="$2" target="$3"
+  if (( had_file )); then
+    cp -a -- "$snapshot" "$target"
+  else
+    rm -f -- "$target"
   fi
 }
 
@@ -170,6 +180,7 @@ install_or_upgrade_acme() {
   local email installer
   require_root
   install_dependencies || return 1
+  acquire_lock || return 1
 
   if have_acme; then
     info "当前版本：$($ACME_BIN --version 2>/dev/null | tail -n 1)"
@@ -244,6 +255,7 @@ update_manager() {
   local timestamp update_dir installer source current_version remote_version installer_version installed_version rc
   require_root
   command -v curl >/dev/null 2>&1 || install_dependencies || return 1
+  acquire_lock || return 1
   MANAGER_UPDATE_CHANGED=0
 
   timestamp="$(date +%s)"
@@ -276,6 +288,11 @@ update_manager() {
   fi
 
   info "远端版本：${remote_version}"
+  if [[ "$(printf '%s\n' "$current_version" "$remote_version" | sort -V | head -n 1)" != "$current_version" ]]; then
+    rm -rf -- "$update_dir"
+    error "拒绝从 ${current_version} 降级到 ${remote_version}。"
+    return 1
+  fi
   if [[ "$remote_version" == "$current_version" ]]; then
     rm -rf -- "$update_dir"
     ok "acme-manager 已经是最新版 ${current_version}。"
@@ -325,6 +342,8 @@ install_command_alias() {
 install_manager_binary() {
   validate_manager_paths || return 1
   install -d -m 0755 "$(dirname "$INSTALL_PATH")" || return 1
+  [[ ! -L "$INSTALL_PATH" ]] || { error "安装目标不能是软链接：${INSTALL_PATH}"; return 1; }
+  [[ ! -e "$INSTALL_PATH" || -f "$INSTALL_PATH" ]] || { error "安装目标必须是普通文件路径：${INSTALL_PATH}"; return 1; }
   if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
     chmod 0755 "$INSTALL_PATH" || return 1
   elif [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
@@ -382,14 +401,33 @@ print_cron_runtime_suffix() {
   esac
 }
 
+scheduler_source_count() {
+  local count=0
+  [[ ! -f "$RENEW_TIMER_FILE" ]] || count=$((count + 1))
+  [[ ! -f "$CRON_FILE" ]] || count=$((count + 1))
+  native_acme_cron_present && count=$((count + 1))
+  printf '%d' "$count"
+}
+
 setup_scheduler() {
   local service_candidate="" timer_candidate="" cron_candidate="" crond_help=""
+  local service_snapshot="" timer_snapshot="" source_count
+  local had_service=0 had_timer=0 timer_was_enabled=0 timer_was_active=0 restore_failed=0
   require_root
   require_acme || return 1
+  acquire_lock || return 1
   ensure_directories || return 1
   install_manager_binary || return 1
 
-  if [[ ! -f "$RENEW_TIMER_FILE" && ! -f "$CRON_FILE" ]] && native_acme_cron_present; then
+  source_count="$(scheduler_source_count)"
+  if (( source_count > 1 )); then
+    error "检测到多套自动续期任务，拒绝继续覆盖。"
+    [[ ! -f "$RENEW_TIMER_FILE" ]] || printf '  - %s\n' "$RENEW_TIMER_FILE" >&2
+    [[ ! -f "$CRON_FILE" ]] || printf '  - %s\n' "$CRON_FILE" >&2
+    native_acme_cron_present && printf '  - root 用户的 acme.sh 原生 crontab\n' >&2
+    return 1
+  fi
+  if native_acme_cron_present; then
     ok "检测到有效的 acme.sh 原生 cron，继续使用现有自动续期，不重复创建任务。"
     return 0
   fi
@@ -398,6 +436,30 @@ setup_scheduler() {
     install -d -m 0755 "$SYSTEMD_UNIT_DIR" || return 1
     service_candidate="$(mktemp /tmp/acme-renew-service.XXXXXX)" || return 1
     timer_candidate="$(mktemp /tmp/acme-renew-timer.XXXXXX)" || { rm -f -- "$service_candidate"; return 1; }
+    service_snapshot="$(mktemp /tmp/acme-renew-service-old.XXXXXX)" || {
+      rm -f -- "$service_candidate" "$timer_candidate"
+      return 1
+    }
+    timer_snapshot="$(mktemp /tmp/acme-renew-timer-old.XXXXXX)" || {
+      rm -f -- "$service_candidate" "$timer_candidate" "$service_snapshot"
+      return 1
+    }
+    if [[ -f "$RENEW_SERVICE_FILE" ]]; then
+      cp -a -- "$RENEW_SERVICE_FILE" "$service_snapshot" || restore_failed=1
+      had_service=1
+    fi
+    if [[ -f "$RENEW_TIMER_FILE" ]]; then
+      cp -a -- "$RENEW_TIMER_FILE" "$timer_snapshot" || restore_failed=1
+      had_timer=1
+    fi
+    systemctl is-enabled --quiet acme-manager-renew.timer 2>/dev/null && timer_was_enabled=1
+    systemctl is-active --quiet acme-manager-renew.timer 2>/dev/null && timer_was_active=1
+    if (( restore_failed )); then
+      rm -f -- "$service_candidate" "$timer_candidate" "$service_snapshot" "$timer_snapshot"
+      error "无法保存原自动续期配置，已停止修改。"
+      return 1
+    fi
+
     cat > "$service_candidate" <<EOF
 [Unit]
 Description=Renew ACME certificates managed by acme-manager
@@ -425,12 +487,31 @@ EOF
     if atomic_install_file "$service_candidate" "$RENEW_SERVICE_FILE" 0644 &&
        atomic_install_file "$timer_candidate" "$RENEW_TIMER_FILE" 0644 &&
        systemctl daemon-reload && systemctl enable --now acme-manager-renew.timer; then
-      rm -f -- "$service_candidate" "$timer_candidate" "$CRON_FILE"
+      rm -f -- "$service_candidate" "$timer_candidate" "$service_snapshot" "$timer_snapshot" "$CRON_FILE"
       ok "自动续期已启用：systemd timer 每 6 小时检查一次。"
       return 0
     fi
-    rm -f -- "$service_candidate" "$timer_candidate"
-    error "systemd timer 配置失败。"
+
+    restore_failed=0
+    restore_file_snapshot "$service_snapshot" "$had_service" "$RENEW_SERVICE_FILE" || restore_failed=1
+    restore_file_snapshot "$timer_snapshot" "$had_timer" "$RENEW_TIMER_FILE" || restore_failed=1
+    systemctl daemon-reload >/dev/null 2>&1 || restore_failed=1
+    if (( timer_was_enabled )); then
+      systemctl enable acme-manager-renew.timer >/dev/null 2>&1 || restore_failed=1
+    else
+      systemctl disable acme-manager-renew.timer >/dev/null 2>&1 || true
+    fi
+    if (( timer_was_active )); then
+      systemctl start acme-manager-renew.timer >/dev/null 2>&1 || restore_failed=1
+    else
+      systemctl stop acme-manager-renew.timer >/dev/null 2>&1 || true
+    fi
+    rm -f -- "$service_candidate" "$timer_candidate" "$service_snapshot" "$timer_snapshot"
+    if (( restore_failed )); then
+      error "systemd timer 配置失败，且原状态恢复不完整，请检查 systemctl。"
+    else
+      error "systemd timer 配置失败，已恢复原配置和状态。"
+    fi
     return 1
   fi
 
@@ -445,7 +526,7 @@ EOF
     if [[ "$crond_help" == *BusyBox* ]]; then
       info "检测到 BusyBox crond，改用 acme.sh 原生用户 crontab。"
       if "$ACME_BIN" --install-cronjob >/dev/null && native_acme_cron_present; then
-        rm -f -- "$CRON_FILE"
+        rm -f -- "$CRON_FILE" "$RENEW_TIMER_FILE" "$RENEW_SERVICE_FILE"
         ok "自动续期已启用：acme.sh 原生 cron 每天检查一次。"
         warn_if_cron_not_running
         return 0
@@ -466,12 +547,18 @@ EOF
     rm -f -- "$cron_candidate"
     return 1
   fi
-  rm -f -- "$cron_candidate"
+  rm -f -- "$cron_candidate" "$RENEW_TIMER_FILE" "$RENEW_SERVICE_FILE"
   ok "自动续期已启用：cron 每天 03:17 检查一次。"
   warn_if_cron_not_running
 }
 
 scheduler_status() {
+  local source_count
+  source_count="$(scheduler_source_count)"
+  if (( source_count > 1 )); then
+    printf '自动续期：检测到多套任务冲突，请运行 acme doctor 检查\n'
+    return 1
+  fi
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system && -f "$RENEW_TIMER_FILE" ]]; then
     if systemctl is-enabled --quiet acme-manager-renew.timer 2>/dev/null; then
       printf '自动续期：systemd timer 已启用'
@@ -498,14 +585,24 @@ scheduler_status() {
 }
 
 acquire_lock() {
+  (( LOCK_HELD == 0 )) || return 0
   if ! ensure_directories || ! exec 9>"$LOCK_FILE"; then
     error "无法创建任务锁：${LOCK_FILE}"
     return 2
   fi
   if ! flock -n 9; then
-    warn "另一个申请或续期任务正在运行，本次操作退出。"
+    exec 9>&-
+    warn "另一个申请、续期或维护任务正在运行，本次操作退出。"
     return 1
   fi
+  LOCK_HELD=1
+}
+
+release_lock() {
+  (( LOCK_HELD != 0 )) || return 0
+  flock -u 9 >/dev/null 2>&1 || true
+  exec 9>&-
+  LOCK_HELD=0
 }
 
 log_command() {
@@ -1523,19 +1620,27 @@ maintenance_menu() {
     case "$choice" in
       1)
         if update_manager && (( MANAGER_UPDATE_CHANGED )); then
+          release_lock
           info "按 Enter 键后重新载入新版菜单。"
           pause
           exec "$INSTALL_PATH"
         fi
+        release_lock
         pause
         ;;
-      2) install_or_upgrade_acme; pause ;;
+      2)
+        install_or_upgrade_acme
+        release_lock
+        pause
+        ;;
       3)
         if install_or_upgrade_acme && update_manager && (( MANAGER_UPDATE_CHANGED )); then
+          release_lock
           info "按 Enter 键后重新载入新版菜单。"
           pause
           exec "$INSTALL_PATH"
         fi
+        release_lock
         pause
         ;;
       0) return 0 ;;
@@ -1557,8 +1662,8 @@ advanced_menu() {
       return 0
     fi
     case "$choice" in
-      1) deploy_existing; pause ;;
-      2) setup_scheduler; pause ;;
+      1) deploy_existing; release_lock; pause ;;
+      2) setup_scheduler; release_lock; pause ;;
       3) doctor; pause ;;
       0) return 0 ;;
       *) error "无效选项。" ;;
@@ -1595,10 +1700,10 @@ main_menu() {
     printf '\n'
     case "$choice" in
       1) maintenance_menu ;;
-      2) issue_certificate; pause ;;
+      2) issue_certificate; release_lock; pause ;;
       3) show_status; pause ;;
-      4) manual_renew_menu; pause ;;
-      5) delete_certificate; pause ;;
+      4) manual_renew_menu; release_lock; pause ;;
+      5) delete_certificate; release_lock; pause ;;
       6)
         read -r -p "主域名：" domain
         show_paths "$domain"

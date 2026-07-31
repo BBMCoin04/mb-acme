@@ -1,6 +1,6 @@
 # acme-manager
 
-Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.3`。
+Linux VPS 中文证书管理脚本，基于官方 `acme.sh`，用于申请、部署、续期和删除 Let's Encrypt ECC 证书。当前版本：`1.1.4`。
 
 ## 安装
 
@@ -118,7 +118,7 @@ sudo acme path example.com key
 
 ## 续期与维护
 
-首次成功部署后会自动配置续期：systemd 每 6 小时检查一次；非 systemd 系统使用已有的 `cron/crond`。已有 `acme.sh` cron 时不会重复创建任务。
+首次成功部署后会自动配置续期：systemd 每 6 小时检查一次；非 systemd 系统使用已有的 `cron/crond`。已有 `acme.sh` cron 时不会重复创建任务；检测到多套续期任务时拒绝覆盖并提示检查。调度器写入或启用失败时恢复原配置和 timer 状态。
 
 ```bash
 sudo acme status                 # 查看证书和续期状态
@@ -130,7 +130,7 @@ sudo acme doctor                 # 运行诊断
 
 只有排障时才使用 `sudo acme renew example.com --force`，否则可能触发 Let's Encrypt 限频。
 
-更新管理器：菜单选择 `1 -> 1`。更新全部选择 `1 -> 3`。已有证书需要重新部署：菜单选择 `8 -> 1`，不必重新申请。重新部署会显示当前 reload 命令，直接回车保留，输入 `-` 可明确清除。
+更新管理器：菜单选择 `1 -> 1`。更新全部选择 `1 -> 3`。管理器拒绝版本降级。已有证书需要重新部署：菜单选择 `8 -> 1`，不必重新申请。重新部署会显示当前 reload 命令，直接回车保留，输入 `-` 可明确清除。
 
 由 acme-manager 执行的签发、部署和续期日志位于 `/var/log/acme-manager/renew.log`，超过 5 MiB 后自动保留最近 2000 行。若沿用安装前已有的 `acme.sh` 原生 cron，该任务不经过管理器，因此不会写入此日志；其输出和日志由原生 cron 与 `acme.sh` 配置决定。
 
@@ -140,6 +140,7 @@ sudo acme doctor                 # 运行诊断
 - 不使用 `curl -k`、`--insecure` 或明文 HTTP 下载。
 - 不修改 DNS、软件源、防火墙或其他网络配置。
 - 不会强制结束占用 80 端口的未知进程。
+- 申请、续期、删除、调度维护和在线更新共用任务锁；交互操作结束后立即释放，不影响后续自动续期。
 - 删除操作要求完整域名二次确认，并受全局任务锁保护。
 - 不包含软件包缓存、Docker、journal 或无关临时文件清理功能。
 - 安装和在线更新信任 HTTPS、GitHub 仓库及 acme.sh 官方安装地址；当前没有独立代码签名。安装器仍会检查脚本标识、版本一致性和 Bash 语法，并输出安装文件 SHA-256。

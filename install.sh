@@ -4,7 +4,7 @@
 set -uo pipefail
 umask 077
 
-INSTALLER_VERSION="1.1.3"
+INSTALLER_VERSION="1.1.4"
 DEFAULT_REPO="BBMCoin04/mb-acme"
 REPO="${ACME_MANAGER_REPO:-$DEFAULT_REPO}"
 REF="${ACME_MANAGER_REF:-main}"
@@ -123,9 +123,18 @@ MANAGER_VERSION="$(awk -F '"' '/^VERSION="[0-9]/{print $2; exit}' "$TEMP_FILE")"
   error "安装器版本 ${INSTALLER_VERSION} 与主程序版本 ${MANAGER_VERSION} 不一致，拒绝安装。"
   exit 1
 }
+if [[ -x "$INSTALL_PATH" ]]; then
+  EXISTING_VERSION="$(ACME_MANAGER_NO_MAIN=0 "$INSTALL_PATH" version 2>/dev/null | awk '{print $2; exit}' || true)"
+  if [[ "$EXISTING_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] &&
+     [[ "$(printf '%s\n' "$EXISTING_VERSION" "$MANAGER_VERSION" | sort -V | head -n 1)" != "$EXISTING_VERSION" ]]; then
+    error "拒绝用 ${MANAGER_VERSION} 覆盖已安装的新版本 ${EXISTING_VERSION}。"
+    exit 1
+  fi
+fi
 
 install -d -m 0755 "$(dirname "$INSTALL_PATH")" "$(dirname "$QUICK_PATH")" "$(dirname "$COMPAT_PATH")" || exit 1
 [[ ! -L "$INSTALL_PATH" ]] || { error "安装目标不能是软链接：${INSTALL_PATH}"; exit 1; }
+[[ ! -e "$INSTALL_PATH" || -f "$INSTALL_PATH" ]] || { error "安装目标必须是普通文件路径：${INSTALL_PATH}"; exit 1; }
 for alias_path in "$QUICK_PATH" "$COMPAT_PATH"; do
   if [[ ( -e "$alias_path" || -L "$alias_path" ) && "$(readlink -f "$alias_path" 2>/dev/null || true)" != "$INSTALL_PATH" ]]; then
     error "命令路径已被其他程序占用，不会覆盖：${alias_path}"
